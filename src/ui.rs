@@ -81,17 +81,24 @@ fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
     if w <= width {
         return line;
     }
+    if width == 0 {
+        return Line::from("");
+    }
     let mut spans = line.spans;
-    let mut budget = width;
-    for s in spans.iter_mut() {
+    let mut budget = width - 1; // reserve one column for the ellipsis
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for s in spans.drain(..) {
         let sw = s.content.chars().count();
         if sw >= budget {
-            s.content = s.content.chars().take(budget).collect();
+            let mut text: String = s.content.chars().take(budget).collect();
+            text.push('…');
+            out.push(Span::styled(text, s.style));
             break;
         }
         budget -= sw;
+        out.push(s);
     }
-    Line::from(spans)
+    Line::from(out)
 }
 
 fn banner(f: &mut Frame, area: Rect, msg: String, color: ratatui::style::Color) {
@@ -193,14 +200,20 @@ fn draw_graph(
     sub: Option<Line<'static>>,
 ) {
     let vmax = vals.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
-    let scale = vmax.max(peak);
+    // percent graphs are pinned to the 0–100 scale so a 45% reading fills
+    // 45% of the panel — auto-scaling would make idle look pegged
+    let scale = if unit.contains('%') { 100.0 } else { vmax.max(peak) };
     let (ref_lines, _ymax) = grid_for_scale(scale);
     let now = vals.iter().rev().find_map(|v| *v).unwrap_or(0.0);
     let fmtv = |v: f64| -> String {
         if unit.contains("tok/s") {
-            fmt_tokens(v)
+            format!("{} tok/s", fmt_tokens(v))
         } else if unit.contains("B/s") {
             fmt_bps(v)
+        } else if unit.contains('%') {
+            format!("{v:.0}%")
+        } else if unit.contains("ms") {
+            format!("{v:.0}ms")
         } else {
             format!("{v:.0}")
         }
@@ -225,7 +238,7 @@ fn draw_graph(
         dt,
         window_secs,
         color,
-        PlotDress { unit, ref_lines: &ref_lines, overlay: None },
+        PlotDress { unit, ref_lines: &ref_lines, overlay: None, dim: t.dim },
     );
 }
 
@@ -312,12 +325,17 @@ pub fn draw(
     paused: bool,
     interval: f64,
     err: &Option<String>,
+    ages: &[Option<u64>],
     window_secs: f64,
 ) {
     let t = theme();
     f.render_widget(Block::new().style(Style::new().bg(t.bg)), f.area());
 
     // header (vllm-top style)
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut spans = vec![Span::styled(
         " sparktop",
         Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
@@ -326,6 +344,21 @@ pub fn draw(
         format!(" · {} node{}", order.len(), if order.len() == 1 { "" } else { "s" }),
         Style::new().fg(t.fg),
     ));
+    if page != Page::Cluster {
+        if let Some(name) = order.get(focused) {
+            spans.push(Span::styled(format!(" · {name}"), Style::new().fg(t.accent)));
+        }
+        // stale-data age: frozen data must never look live
+        if let Some(Some(ok)) = ages.get(focused) {
+            let age = now_s.saturating_sub(*ok);
+            if age > 3 {
+                spans.push(Span::styled(
+                    format!(" · data {}s old", age),
+                    Style::new().fg(if age > 10 { t.bad } else { t.warn }).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+    }
     spans.push(Span::styled(format!(" · poll {interval:.1}s"), Style::new().fg(t.dim)));
     if paused {
         spans.push(Span::styled(" · ⏸ paused", Style::new().fg(t.warn).add_modifier(Modifier::BOLD)));
@@ -333,13 +366,27 @@ pub fn draw(
     if let Some(e) = err {
         spans.push(Span::styled(format!(" · ⚠ {e}"), Style::new().fg(t.bad)));
     }
-    spans.push(Span::styled(
-        "  [1 cluster · 2 node · 3 vllm · tab node · space pause · t theme · q quit]",
-        Style::new().fg(t.dim),
-    ));
-    f.render_widget(Paragraph::new(Line::from(spans)), f.area());
+    let hints = "[1/2/3 pages · tab node · space pause · t theme · q quit]";
+    spans.push(Span::styled(format!("  {hints}"), Style::new().fg(t.dim)));
+    // keep the full hint readable: drop earlier spans before cutting mid-word
+    let width = f.area().width as usize;
+    let mut kept: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    for s in spans.iter().rev() {
+        let l = s.content.chars().count();
+        if used + l > width {
+            break;
+        }
+        used += l;
+        kept.push(s.clone());
+    }
+    kept.reverse();
+    f.render_widget(Paragraph::new(Line::from(kept)), f.area());
 
-    let body = Rect { y: f.area().y + 1, height: f.area().height.saturating_sub(1), ..f.area() };
+    // reserve the last row for the pause/error banner instead of
+    // overdrawing the outer panel border
+    let body_h = f.area().height.saturating_sub(2);
+    let body = Rect { y: f.area().y + 1, height: body_h, ..f.area() };
     match page {
         Page::Cluster => draw_cluster(f, body, cluster, order, focused, err, window_secs),
         Page::Node => draw_node(f, body, cluster, order.get(focused), window_secs),
@@ -441,7 +488,7 @@ fn draw_cluster(
         let gpu_peak = gv.iter().filter_map(|v| *v).fold(0.0, f64::max);
         let net_peak = nv.iter().filter_map(|v| *v).fold(0.0, f64::max);
         draw_graph(f, t, cols[0], "GPU", "compute", &gv, &ndt, window_secs, t.s3, "%", gpu_peak, None);
-        draw_graph(f, t, cols[1], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "", net_peak, None);
+        draw_graph(f, t, cols[1], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "B/s", net_peak, None);
         let _ = ndt;
     }
 }
@@ -515,7 +562,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
             }
             let pct = d.per_core_pct.get(i).copied().unwrap_or(0.0);
             let bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-            let b = bars[((pct / 100.0) * 7.999).round() as usize % 8];
+            let b = bars[(((pct / 100.0) * 7.999).round() as usize).min(7)];
             lines.push(Line::from(vec![
                 Span::styled(format!("C{i:<2} "), Style::new().fg(t.dim)),
                 Span::styled(b, Style::new().fg(usage_color(t, pct / 100.0))),
@@ -569,7 +616,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         Style::new().fg(t.dim),
     ));
     let net_peak = nv.iter().filter_map(|v| *v).fold(0.0, f64::max);
-    draw_graph(f, t, net_cols[0], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "", net_peak, Some(net_sub));
+    draw_graph(f, t, net_cols[0], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "B/s", net_peak, Some(net_sub));
 
     let tot_rx: u64 = s.net.values().map(|n| n.rx_bytes).sum();
     let tot_tx: u64 = s.net.values().map(|n| n.tx_bytes).sum();
@@ -578,11 +625,11 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     let mut net_kvs = vec![
         Kv::colored("↓ now", fmt_bps(d.net_rx_bps), "receive", t.s1),
         Kv::colored("↑ now", fmt_bps(d.net_tx_bps), "transmit", t.s2),
-        Kv::plain("rx total", fmt_mb(tot_rx as f64 / 1048576.0), "since boot"),
-        Kv::plain("tx total", fmt_mb(tot_tx as f64 / 1048576.0), "since boot"),
+        Kv::plain("↓ total", fmt_mb(tot_rx as f64 / 1048576.0), "since boot"),
+        Kv::plain("↑ total", fmt_mb(tot_tx as f64 / 1048576.0), "since boot"),
     ];
     for (n, _) in ifaces.iter().take(3) {
-        net_kvs.push(Kv::gloss_only(format!("{n} — ConnectX-7 200GbE or mgmt")));
+        net_kvs.push(Kv::gloss_only(format!("iface {n}")));
     }
     let net_block = block_titled(
         Line::from(Span::styled(" totals ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD))),
@@ -601,7 +648,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         format!(" write {} ", fmt_bps(d.disk_write_bps)),
         Style::new().fg(t.dim),
     ));
-    draw_graph(f, t, dp_cols[0], "disk read", "nvme", &dv, &ddt, window_secs, t.s2, "", disk_peak, Some(disk_sub));
+    draw_graph(f, t, dp_cols[0], "disk read", "nvme", &dv, &ddt, window_secs, t.s2, "B/s", disk_peak, Some(disk_sub));
 
     let proc_block = block_titled(
         Line::from(Span::styled(" gpu processes ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD))),

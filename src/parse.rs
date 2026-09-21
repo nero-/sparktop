@@ -12,34 +12,34 @@ pub fn parse_collection(raw: &str, t_unix_us: u64) -> anyhow::Result<Sample> {
         if let Some(rest) = line.strip_prefix("===").and_then(|l| l.strip_suffix("===")) {
             match section {
                 "HOSTNAME" => s.hostname = buf.trim().to_string(),
-                "UPTIME" => {
-                    // "up 2 days, 3:14"  or load averages line
-                    if let Some(after) = buf.trim().split_once("load average:") {
-                        let la: Vec<f64> = after
-                            .1
-                            .split(',')
-                            .filter_map(|x| x.trim().parse().ok())
-                            .collect();
-                        if la.len() == 3 {
-                            s.cpu.load1 = la[0];
-                            s.cpu.load5 = la[1];
-                            s.cpu.load15 = la[2];
-                        }
-                        // also grab proc counts from "x users, load average"
-                    }
-                    // uptime seconds from `awk '{print $1}' /proc/uptime` variant
-                }
                 "UPTIME_S" => {
                     s.uptime_s = buf.trim().split('.').next().unwrap_or("0").parse().unwrap_or(0);
                     if let Some(l) = buf.lines().nth(1) {
-                        let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-                        if f.len() >= 2 {
-                            s.cpu.procs_running = f[0] as u32;
-                            s.cpu.procs_total = f[1] as u32;
+                        // " 09:08:31 up 2:26, 3 users, load average: 0.15, 6.56, 9.25"
+                        if let Some(after) = l.split_once("load average:") {
+                            let la: Vec<f64> = after
+                                .1
+                                .split(',')
+                                .filter_map(|x| x.trim().parse().ok())
+                                .collect();
+                            if la.len() == 3 {
+                                s.cpu.load1 = la[0];
+                                s.cpu.load5 = la[1];
+                                s.cpu.load15 = la[2];
+                            }
                         }
                     }
                 }
-                "CPU" => s.cpu = parse_proc_stat(buf.trim())?,
+                // CPU replaces the whole struct — it runs after UPTIME_S,
+                // so re-apply the load averages parsed there (they live in
+                // the Cpu struct)
+                "CPU" => {
+                    let load = (s.cpu.load1, s.cpu.load5, s.cpu.load15);
+                    s.cpu = parse_proc_stat(buf.trim())?;
+                    s.cpu.load1 = load.0;
+                    s.cpu.load5 = load.1;
+                    s.cpu.load15 = load.2;
+                }
                 "CPUFREQ" => {
                     s.cpu.mhz = buf
                         .lines()
@@ -71,6 +71,30 @@ pub fn parse_collection(raw: &str, t_unix_us: u64) -> anyhow::Result<Sample> {
 fn parse_proc_stat(text: &str) -> anyhow::Result<Cpu> {
     let mut cpu = Cpu::default();
     for line in text.lines() {
+        if line.starts_with("procs_running ") {
+            cpu.procs_running = line["procs_running ".len()..].trim().parse().unwrap_or(0);
+            continue;
+        }
+        if line.starts_with("procs_total ") {
+            cpu.procs_total = line["procs_total ".len()..].trim().parse().unwrap_or(0);
+            continue;
+        }
+        if line.starts_with("procs_blocked ") {
+            // some kernels omit procs_total; blocked+running is a fine proxy
+            if cpu.procs_total == 0 {
+                cpu.procs_total = cpu.procs_running
+                    + line["procs_blocked ".len()..].trim().parse::<u32>().unwrap_or(0);
+            }
+            continue;
+        }
+        if line.starts_with("processes ")
+            || line.starts_with("softirq ")
+            || line.starts_with("intr ")
+            || line.starts_with("ctxt ")
+            || line.starts_with("btime ")
+        {
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("cpu") {
             let fields: Vec<u64> =
                 rest.split_whitespace().filter_map(|f| f.parse().ok()).collect();
@@ -85,13 +109,18 @@ fn parse_proc_stat(text: &str) -> anyhow::Result<Cpu> {
             } else {
                 let idx: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = idx.parse::<usize>() {
-                    if n == cpu.cores.len() {
-                        cpu.cores.push((idle, total));
+                    // store per-index, resize on demand: tolerant of
+                    // non-contiguous / offline cores
+                    if cpu.cores.len() <= n {
+                        cpu.cores.resize(n + 1, (0, 0));
                     }
+                    cpu.cores[n] = (idle, total);
                 }
             }
         }
     }
+    // drop placeholder slots for never-seen cores
+    cpu.cores.retain(|(_, total)| *total > 0);
     Ok(cpu)
 }
 

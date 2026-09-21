@@ -54,6 +54,9 @@ fn main() -> anyhow::Result<()> {
     let cluster: Arc<Mutex<Cluster>> =
         Arc::new(Mutex::new(node_names.iter().map(|n| (n.clone(), NodeHistory::new())).collect()));
     let last_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // per-node unix seconds of last successful poll — data-age display
+    let ages: Arc<Mutex<Vec<Option<u64>>>> =
+        Arc::new(Mutex::new(vec![None; node_names.len()]));
 
     if args.once {
         for p in &pollers {
@@ -73,11 +76,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Background poll threads: one per node.
-    for p in pollers.clone() {
+    for (i, p) in pollers.clone().into_iter().enumerate() {
         let cluster = cluster.clone();
         let last_err = last_err.clone();
+        let ages = ages.clone();
         std::thread::spawn(move || loop {
-            if PAUSED.load(Ordering::Relaxed) {
+            let paused = PAUSED.load(Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            if paused {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -94,13 +100,19 @@ fn main() -> anyhow::Result<()> {
                             h.push(s);
                         }
                     }
+                    ages.lock()[i] = p.lock().last_ok_s;
                     *last_err.lock() = None;
                 }
                 Err(e) => {
                     *last_err.lock() = Some(format!("{}: {e}", p.lock().node.name));
                 }
             }
-            std::thread::sleep(Duration::from_secs_f64(interval));
+            // poll cadence = interval from poll start, so the effective
+            // period matches the advertised interval even when ssh is slow
+            let elapsed = start.elapsed();
+            if elapsed < Duration::from_secs_f64(interval) {
+                std::thread::sleep(Duration::from_secs_f64(interval) - elapsed);
+            }
         });
     }
 
@@ -127,7 +139,7 @@ fn main() -> anyhow::Result<()> {
 
     while running {
         terminal.draw(|f| {
-            sparktop::ui::draw(f, &cluster.lock(), &node_names, page, focused, PAUSED.load(Ordering::Relaxed), interval, &last_err.lock(), 60.0);
+            sparktop::ui::draw(f, &cluster.lock(), &node_names, page, focused, PAUSED.load(Ordering::Relaxed), interval, &last_err.lock(), &ages.lock(), 60.0);
         })?;
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if let crossterm::event::Event::Key(k) = ev {

@@ -34,15 +34,21 @@ fi
 echo ===END===
 "#;
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 pub struct Poller {
     pub node: NodeConfig,
     last_err: Option<String>,
     consecutive_errs: u32,
+    /// unix seconds of the last successful poll — drives the data-age indicator
+    pub last_ok_s: Option<u64>,
 }
 
 impl Poller {
     pub fn new(node: NodeConfig) -> Self {
-        Self { node, last_err: None, consecutive_errs: 0 }
+        Self { node, last_err: None, consecutive_errs: 0, last_ok_s: None }
     }
 
     /// Collect one sample. Uses a warm ssh ControlMaster when available,
@@ -61,17 +67,21 @@ impl Poller {
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
             "-o", "ControlMaster=auto",
-            "-o", "ControlPath=/tmp/sparktop-ssh-%r@%h:%p",
+            "-o", "ControlPath=/tmp/sparktop-%u-ssh-%r@%h:%p",
             "-o", "ControlPersist=120",
             "-o", "ServerAliveInterval=15",
             target.as_str(),
-            COLLECT_SCRIPT,
         ]);
         // vLLM metrics are scraped from the node itself (localhost), so the
         // vllm_url in config only needs to be reachable from the node.
-        if let Some(url) = &self.node.vllm_url {
-            cmd.env("SPARKTOP_VLLM_URL", url);
-        }
+        // ssh does not forward arbitrary env vars — embed as a POSIX
+        // env-assignment prefix on the remote command.
+        let remote = if let Some(url) = &self.node.vllm_url {
+            format!("SPARKTOP_VLLM_URL={} {}", shell_quote(url), COLLECT_SCRIPT)
+        } else {
+            COLLECT_SCRIPT.to_string()
+        };
+        cmd.arg(remote);
         let out = cmd.output().context("ssh spawn failed")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -81,6 +91,7 @@ impl Poller {
         }
         self.consecutive_errs = 0;
         self.last_err = None;
+        self.last_ok_s = Some(t / 1_000_000);
         parse_collection(&String::from_utf8_lossy(&out.stdout), t)
     }
 

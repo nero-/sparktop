@@ -104,26 +104,57 @@ impl NodeHistory {
             .map(|(i, dev)| (i.clone(), (dev.rx_bytes, dev.tx_bytes)))
             .collect();
 
-        // Disk: sum non-partition devices
+        // Disk: sum whole disks, skip partitions and loop/ram devices.
+        // Whole disks: nvme\d+n\d+ (nvme0n1), mmcblk\d+; partitions end in
+        // p<digits> (nvme0n1p1) or are sd/vd/hd + digit.
+        let is_partition = |name: &str| -> bool {
+            if let Some(pos) = name.rfind('p') {
+                if name[pos + 1..].bytes().all(|c| c.is_ascii_digit())
+                    && !name[pos + 1..].is_empty()
+                {
+                    // nvme0n1p1 / mmcblk0p2 — but not a whole disk named e.g. "p1"
+                    return pos > 0;
+                }
+            }
+            (name.starts_with("sd") || name.starts_with("vd") || name.starts_with("hd"))
+                && name[2..].bytes().all(|c| c.is_ascii_digit())
+        };
         let mut dr = 0u64;
         let mut dw = 0u64;
         for (name, dev) in &s.disks {
-            if name.ends_with(|c: char| c.is_ascii_digit()) && !name.contains("nvme") {
+            if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
                 continue;
             }
-            if name.ends_with(|c: char| c.is_ascii_digit()) && name.starts_with("nvme") {
-                continue; // partitions like nvme0n1p1
+            if is_partition(name) {
+                continue;
             }
             dr += dev.read_bytes;
             dw += dev.write_bytes;
         }
-        let prev_dr: u64 = self.prev_disk.values().map(|v| v.0).sum();
-        let prev_dw: u64 = self.prev_disk.values().map(|v| v.1).sum();
+        // keep the same filter on both sides of the delta, or the difference
+        // undercounts by cumulative partition bytes
+        let prev_dr: u64 = self
+            .prev_disk
+            .iter()
+            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
+            .map(|(_, v)| v.0)
+            .sum();
+        let prev_dw: u64 = self
+            .prev_disk
+            .iter()
+            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
+            .map(|(_, v)| v.1)
+            .sum();
         if prev_dr > 0 && dr > prev_dr {
             d.disk_read_bps = (dr - prev_dr) as f64;
             d.disk_write_bps = (dw - prev_dw) as f64;
         }
-        self.prev_disk = s.disks.iter().map(|(n, v)| (n.clone(), (v.read_bytes, v.write_bytes))).collect();
+        self.prev_disk = s
+            .disks
+            .iter()
+            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
+            .map(|(n, v)| (n.clone(), (v.read_bytes, v.write_bytes)))
+            .collect();
 
         // vLLM token rates from cumulative counters
         if let Some(v) = &s.vllm {

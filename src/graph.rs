@@ -4,6 +4,7 @@
 //! observed peak, unit on the lowest gridline label, newest sample pinned
 //! to the right edge.
 use ratatui::{
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
@@ -40,6 +41,8 @@ pub struct PlotDress<'a> {
     pub ref_lines: &'a [f64],
     /// optional overlay series drawn as a connected line over the fill
     pub overlay: Option<(&'a [Option<f64>], Color)>,
+    /// dim color for gridline labels (faded, must not compete with data)
+    pub dim: Color,
 }
 
 /// Draw the fill graph into `area` (already inside the panel borders).
@@ -57,9 +60,30 @@ pub fn mini_line_graph(
     let unit = dress.unit;
     let ref_lines = dress.ref_lines;
     let overlay = dress.overlay;
-    if dt.is_empty() || window_secs <= 0.0 || area.width == 0 || area.height == 0 {
+    let dim = dress.dim;
+    if window_secs <= 0.0 || area.width == 0 || area.height == 0 {
         return;
     }
+    // all-None (no successful poll yet) or all-zero: render an idle gloss
+    // instead of a misleading blank panel
+    let has_data = vals.iter().any(|v| v.map(|v| v > 0.0).unwrap_or(false));
+    if vals.iter().all(|v| v.is_none()) || (!has_data && vals.iter().all(|v| v.is_some())) {
+        let row = Rect { y: area.y + area.height / 2, height: 1, ..area };
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                ratatui::text::Span::styled(" idle ", ratatui::style::Style::new().fg(dim)),
+            )),
+            row,
+        );
+        return;
+    }
+    // single sample with no dt yet: seed a nominal interval so the newest
+    // value renders instead of a blank panel for the first second
+    let dt: Vec<f64> = if dt.is_empty() && !vals.is_empty() {
+        vec![window_secs.min(1.0)]
+    } else {
+        dt.to_vec()
+    };
     let w_dots = (area.width as f64) * 2.0;
     let h_dots = (area.height as f64) * 4.0;
     let span: f64 = dt.iter().sum::<f64>();
@@ -168,7 +192,7 @@ pub fn mini_line_graph(
                 }
             }
             for (y, text) in &labels {
-                ctx.print(2.0, *y, Span::styled(text.clone(), Style::new().fg(color)));
+                ctx.print(2.0, *y, Span::styled(text.clone(), Style::new().fg(dim)));
             }
             for (cx, h) in &cols {
                 ctx.draw(&CLine { x1: *cx, y1: 0.0, x2: *cx, y2: *h, color });
