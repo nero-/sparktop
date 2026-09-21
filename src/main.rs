@@ -126,6 +126,15 @@ fn main() -> anyhow::Result<()> {
     let mut page = Page::Cluster;
     let mut focused: usize = 0;
     let mut running = true;
+    let mut window_idx: usize = 0;
+    // per-page chart selections (empty = defaults)
+    let mut cluster_charts: Vec<sparktop::ui::ChartKind> = vec![
+        sparktop::ui::ChartKind::Gpu,
+        sparktop::ui::ChartKind::Mem,
+        sparktop::ui::ChartKind::Net,
+    ];
+    let mut node_charts: Vec<sparktop::ui::ChartKind> = Vec::new(); // defaults: cpu/mem/gpu
+    let mut show_help = false;
     let (tx, rx) = std::sync::mpsc::channel::<crossterm::event::Event>();
     std::thread::spawn(move || {
         loop {
@@ -139,14 +148,30 @@ fn main() -> anyhow::Result<()> {
 
     while running {
         terminal.draw(|f| {
-            sparktop::ui::draw(f, &cluster.lock(), &node_names, page, focused, PAUSED.load(Ordering::Relaxed), interval, &last_err.lock(), &ages.lock(), 60.0);
+            sparktop::ui::draw(
+                f,
+                &cluster.lock(),
+                &node_names,
+                page,
+                focused,
+                PAUSED.load(Ordering::Relaxed),
+                interval,
+                &last_err.lock(),
+                &ages.lock(),
+                sparktop::ui::WINDOWS[window_idx],
+                &cluster_charts,
+                &node_charts,
+                show_help,
+            );
         })?;
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if let crossterm::event::Event::Key(k) = ev {
                 if k.kind == crossterm::event::KeyEventKind::Press {
                     use crossterm::event::KeyCode::*;
                     match k.code {
-                        Char('q') | Esc => running = false,
+                        Char('q') => running = false,
+                        Esc if show_help => show_help = false,
+                        Esc => running = false,
                         Char(' ') => {
                             PAUSED.store(!PAUSED.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
@@ -156,6 +181,38 @@ fn main() -> anyhow::Result<()> {
                         Char('t') => {
                             sparktop::ui::THEME_IDX.fetch_add(1, Ordering::Relaxed);
                         }
+                        Char('w') => {
+                            window_idx = (window_idx + 1) % sparktop::ui::WINDOWS.len();
+                        }
+                        Char('e') => {
+                            // add the next chart kind not already shown
+                            let charts = match page {
+                                Page::Cluster => &mut cluster_charts,
+                                Page::Node => &mut node_charts,
+                                Page::Vllm => continue,
+                            };
+                            let mut next = charts.last().copied().unwrap_or(sparktop::ui::ChartKind::Net).next();
+                            while charts.contains(&next) {
+                                next = next.next();
+                            }
+                            charts.push(next);
+                        }
+                        Char('r') => {
+                            let charts = match page {
+                                Page::Cluster => &mut cluster_charts,
+                                Page::Node => &mut node_charts,
+                                Page::Vllm => continue,
+                            };
+                            charts.pop();
+                        }
+                        Char('c') => {
+                            match page {
+                                Page::Cluster => cluster_charts = vec![sparktop::ui::ChartKind::Gpu, sparktop::ui::ChartKind::Mem, sparktop::ui::ChartKind::Net],
+                                Page::Node => node_charts = Vec::new(), // defaults
+                                Page::Vllm => {}
+                            }
+                        }
+                        Char('?') => show_help = !show_help,
                         Tab => focused = (focused + 1) % node_names.len().max(1),
                         BackTab => focused = focused.checked_sub(1).unwrap_or(node_names.len().saturating_sub(1)),
                         _ => {}

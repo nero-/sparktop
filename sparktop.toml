@@ -6,7 +6,7 @@ interval = 1.0
 name = "spark-r0"
 host = "192.168.50.219"
 user = "nero"
-# vllm_url = "http://localhost:8000"   # uncomment when vLLM runs on this node
+vllm_url = "http://192.168.50.219:8000/v1"   # uncomment when vLLM runs on this node
 
 # Tomorrow's second node — uncomment when it's up:
 # [[nodes]]

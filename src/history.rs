@@ -8,6 +8,8 @@ pub const HISTORY_CAP: usize = 900; // ~15 min at 1s
 #[derive(Debug, Clone, Default)]
 pub struct Derived {
     pub cpu_pct: f64,
+    pub mem_used_pct: f64,
+    pub load1: f64,
     pub per_core_pct: Vec<f64>,
     pub net_rx_bps: f64,
     pub net_tx_bps: f64,
@@ -61,6 +63,13 @@ impl NodeHistory {
 
     fn derive(&mut self, s: &Sample) -> Derived {
         let mut d = Derived::default();
+
+        d.mem_used_pct = if s.mem.total_kb > 0 {
+            100.0 * s.mem.used_kb() as f64 / s.mem.total_kb as f64
+        } else {
+            0.0
+        };
+        d.load1 = s.cpu.load1;
 
         // CPU
         if self.prev_cpu.1 > 0 && s.cpu.all.1 > self.prev_cpu.1 {

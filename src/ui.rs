@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Clear},
     Frame,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +19,95 @@ pub static THEME_IDX: AtomicUsize = AtomicUsize::new(0);
 
 pub fn theme() -> &'static Theme {
     &THEMES[THEME_IDX.load(Ordering::Relaxed) % THEMES.len()]
+}
+
+// ── timescale windows ────────────────────────────────────────────────
+pub const WINDOWS: [f64; 3] = [60.0, 300.0, 900.0];
+pub const WINDOW_LABELS: [&str; 3] = ["60s", "5m", "15m"];
+
+pub fn window_label(secs: f64) -> &'static str {
+    for (i, w) in WINDOWS.iter().enumerate() {
+        if *w == secs {
+            return WINDOW_LABELS[i];
+        }
+    }
+    "?"
+}
+
+// ── chart selection (page 1 + 2 add/remove) ─────────────────────────
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChartKind {
+    Gpu,
+    Mem,
+    Cpu,
+    Net,
+    Disk,
+    Load,
+}
+
+impl ChartKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            ChartKind::Gpu => "GPU",
+            ChartKind::Mem => "memory",
+            ChartKind::Cpu => "CPU",
+            ChartKind::Net => "network ↓",
+            ChartKind::Disk => "disk read",
+            ChartKind::Load => "load avg",
+        }
+    }
+    pub fn gloss(self) -> &'static str {
+        match self {
+            ChartKind::Gpu => "compute",
+            ChartKind::Mem => "unified pool",
+            ChartKind::Cpu => "aggregate",
+            ChartKind::Net => "receive",
+            ChartKind::Disk => "nvme",
+            ChartKind::Load => "1m average",
+        }
+    }
+    pub fn next(self) -> Self {
+        use ChartKind::*;
+        match self {
+            Gpu => Mem,
+            Mem => Cpu,
+            Cpu => Net,
+            Net => Disk,
+            Disk => Load,
+            Load => Gpu,
+        }
+    }
+}
+
+/// The value series for a chart kind, as (vals, dt) with gaps at bad polls.
+fn chart_series(h: &NodeHistory, kind: ChartKind) -> (Vec<Option<f64>>, Vec<f64>) {
+    match kind {
+        ChartKind::Gpu => (gpu_vals(h), dt_of(h)),
+        ChartKind::Mem => gaps(h, |d| d.mem_used_pct),
+        ChartKind::Cpu => gaps(h, |d| d.cpu_pct),
+        ChartKind::Net => gaps(h, |d| d.net_rx_bps),
+        ChartKind::Disk => gaps(h, |d| d.disk_read_bps),
+        ChartKind::Load => gaps(h, |d| d.load1),
+    }
+}
+
+fn chart_unit(kind: ChartKind) -> &'static str {
+    match kind {
+        ChartKind::Gpu | ChartKind::Mem | ChartKind::Cpu => "%",
+        ChartKind::Net | ChartKind::Disk => "B/s",
+        ChartKind::Load => "",
+    }
+}
+
+fn chart_color(kind: ChartKind, t: &Theme) -> ratatui::style::Color {
+    match kind {
+        ChartKind::Gpu => t.s3,
+        ChartKind::Mem => t.warn,
+        ChartKind::Cpu => t.s1,
+        ChartKind::Net => t.s1,
+        ChartKind::Disk => t.s2,
+        ChartKind::Load => t.accent,
+    }
 }
 
 // ── formatting (vllm-top conventions) ────────────────────────────────
@@ -157,6 +246,21 @@ fn kv_lines(t: &Theme, entries: Vec<Kv>, width: usize) -> Vec<Line<'static>> {
 }
 
 // ── series prep ──────────────────────────────────────────────────────
+fn dt_of(h: &NodeHistory) -> Vec<f64> {
+    if h.samples.len() > 1 {
+        h.samples
+            .windows(2)
+            .map(|w| {
+                ((w[1].t_unix_us.max(w[0].t_unix_us) - w[0].t_unix_us.min(w[1].t_unix_us)) as f64
+                    / 1e6)
+                    .clamp(0.1, 60.0)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 fn gaps(h: &NodeHistory, sel: impl Fn(&Derived) -> f64) -> (Vec<Option<f64>>, Vec<f64>) {
     let vals: Vec<Option<f64>> = h
         .derived
@@ -170,15 +274,7 @@ fn gaps(h: &NodeHistory, sel: impl Fn(&Derived) -> f64) -> (Vec<Option<f64>>, Ve
             }
         })
         .collect();
-    let dt: Vec<f64> = if h.samples.len() > 1 {
-        h.samples
-            .windows(2)
-            .map(|w| ((w[1].t_unix_us.max(w[0].t_unix_us) - w[0].t_unix_us.min(w[1].t_unix_us)) as f64 / 1e6).clamp(0.1, 60.0))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    (vals, dt)
+    (vals, dt_of(h))
 }
 
 fn gpu_vals(h: &NodeHistory) -> Vec<Option<f64>> {
@@ -215,14 +311,14 @@ fn draw_graph(
         } else if unit.contains("ms") {
             format!("{v:.0}ms")
         } else {
-            format!("{v:.0}")
+            format!("{v:.2}")
         }
     };
     let mut title_spans = vec![
         Span::styled(format!(" {title} "), Style::new().fg(t.fg).add_modifier(Modifier::BOLD)),
         Span::styled(format!("({gloss}) "), Style::new().fg(t.dim)),
         Span::styled(
-            format!("— {} {} · peak {} ", "now", fmtv(now), fmtv(scale)),
+            format!("— {} {} · peak {} ", "now", fmtv(now), fmtv(scale.max(peak))),
             Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
         ),
         Span::styled("● ", Style::new().fg(color).add_modifier(Modifier::BOLD)),
@@ -276,24 +372,24 @@ fn hero_cells_for_node(s: &Sample, d: &Derived, t: &Theme) -> Vec<(String, Vec<L
         "unified — CPU + GPU share",
         bold(usage_color(t, mem_frac)),
     ));
-    let mut rate_lines = vec![
-        Line::from(vec![
-            Span::styled(" load ", Style::new().fg(t.dim)),
-            Span::styled(format!("{:.2}", s.cpu.load1), bold(t.s3)),
-            Span::styled(format!("  ·  {}", triple(&[Some(s.cpu.load5), Some(s.cpu.load15), None])), Style::new().fg(t.dim)),
-        ]),
-        Line::from(vec![
-            Span::styled(" cores ", Style::new().fg(t.dim)),
-            Span::styled(
-                format!("{}", s.cpu.cores.len()),
-                bold(t.s1),
-            ),
-            Span::styled(format!("  ·  {} running", s.cpu.procs_running), Style::new().fg(t.dim)),
-        ]),
-    ];
-    let _ = d;
-    cells.push(("CPU".into(), rate_lines.clone()));
-    rate_lines.clear();
+    cells.push((
+        "CPU".into(),
+        vec![
+            Line::from(vec![
+                Span::styled(" load ", Style::new().fg(t.dim)),
+                Span::styled(format!("{:.2}", d.load1.max(s.cpu.load1)), bold(t.s3)),
+                Span::styled(
+                    format!("  ·  {}", triple(&[Some(s.cpu.load5), Some(s.cpu.load15), None])),
+                    Style::new().fg(t.dim),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" cores ", Style::new().fg(t.dim)),
+                Span::styled(format!("{}", s.cpu.cores.len()), bold(t.s1)),
+                Span::styled(format!("  ·  {} running", s.cpu.procs_running), Style::new().fg(t.dim)),
+            ]),
+        ],
+    ));
     cells.push(hero_cell(
         "POWER",
         &format!("{:.1}W", gpu.map(|g| g.power_w).unwrap_or(0.0)),
@@ -315,6 +411,103 @@ fn hero_cells_for_node(s: &Sample, d: &Derived, t: &Theme) -> Vec<(String, Vec<L
     cells
 }
 
+/// Render hero cells across `area` at fixed column widths.
+fn render_hero(f: &mut Frame, t: &Theme, area: Rect, cells: &[(String, Vec<Line<'static>>)], col_ws: &[u16]) {
+    let mut x = area.x;
+    for (ci, (label, lines)) in cells.iter().enumerate() {
+        if ci >= col_ws.len() {
+            break;
+        }
+        let w = col_ws[ci].min(area.width.saturating_sub(x - area.x));
+        let cell_area = Rect { x, width: w, ..area };
+        let mut ls = vec![Line::from(Span::styled(label.to_lowercase(), Style::new().fg(t.dim)))];
+        for l in lines {
+            ls.push(truncate_line(l.clone(), w as usize));
+        }
+        f.render_widget(Paragraph::new(ls), cell_area);
+        x += w;
+    }
+}
+
+/// Help overlay (vllm-top `?` style): centered panel over the page.
+fn draw_help(f: &mut Frame, area: Rect) {
+    let t = theme();
+    let w = 62.min(area.width.saturating_sub(4));
+    let h = 24.min(area.height.saturating_sub(4));
+    if w < 30 || h < 10 {
+        return;
+    }
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, popup);
+    let block = block_titled(
+        Line::from(Span::styled(
+            " keys ",
+            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+        )),
+        Some(Line::from(Span::styled(" press ? or esc to close ", Style::new().fg(t.dim)))),
+        t,
+    );
+    f.render_widget(block, popup);
+    let inner = Rect { x: x + 1, y: y + 1, width: w - 2, height: h - 2 };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" 1 2 3      ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cluster / node / vllm pages", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" tab       ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("switch focused node", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" w         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("graph timescale: 60s → 5m → 15m", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" e         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("add next chart to this page (pages 1+2)", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" r         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("remove last chart from this page (pages 1+2)", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" c         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("reset page charts to defaults", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" space     ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("pause / resume polling", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" t         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("theme: gruvbox → catppuccin → tokyonight", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" q / esc   ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("quit", Style::new().fg(t.fg)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" chart kinds", Style::new().fg(t.dim).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "  gpu · memory · cpu · network · disk · load",
+            Style::new().fg(t.dim),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(" data notes", Style::new().fg(t.dim).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "  % graphs are pinned 0–100; others autoscale to peak",
+            Style::new().fg(t.dim),
+        )),
+        Line::from(Span::styled(
+            "  vLLM page needs vllm_url in sparktop.toml",
+            Style::new().fg(t.dim),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 // ── top-level draw ───────────────────────────────────────────────────
 pub fn draw(
     f: &mut Frame,
@@ -327,6 +520,9 @@ pub fn draw(
     err: &Option<String>,
     ages: &[Option<u64>],
     window_secs: f64,
+    cluster_charts: &[ChartKind],
+    node_charts: &[ChartKind],
+    show_help: bool,
 ) {
     let t = theme();
     f.render_widget(Block::new().style(Style::new().bg(t.bg)), f.area());
@@ -360,13 +556,17 @@ pub fn draw(
         }
     }
     spans.push(Span::styled(format!(" · poll {interval:.1}s"), Style::new().fg(t.dim)));
+    spans.push(Span::styled(
+        format!(" · window {}", window_label(window_secs)),
+        Style::new().fg(t.dim),
+    ));
     if paused {
         spans.push(Span::styled(" · ⏸ paused", Style::new().fg(t.warn).add_modifier(Modifier::BOLD)));
     }
     if let Some(e) = err {
         spans.push(Span::styled(format!(" · ⚠ {e}"), Style::new().fg(t.bad)));
     }
-    let hints = "[1/2/3 pages · tab node · space pause · t theme · q quit]";
+    let hints = "[1/2/3 · tab node · w window · e add chart · r rm · ? help · q quit]";
     spans.push(Span::styled(format!("  {hints}"), Style::new().fg(t.dim)));
     // keep the full hint readable: drop earlier spans before cutting mid-word
     let width = f.area().width as usize;
@@ -388,8 +588,8 @@ pub fn draw(
     let body_h = f.area().height.saturating_sub(2);
     let body = Rect { y: f.area().y + 1, height: body_h, ..f.area() };
     match page {
-        Page::Cluster => draw_cluster(f, body, cluster, order, focused, err, window_secs),
-        Page::Node => draw_node(f, body, cluster, order.get(focused), window_secs),
+        Page::Cluster => draw_cluster(f, body, cluster, order, focused, err, window_secs, cluster_charts),
+        Page::Node => draw_node(f, body, cluster, order.get(focused), window_secs, node_charts),
         Page::Vllm => draw_vllm(f, body, cluster, order.get(focused), window_secs),
     }
 
@@ -397,6 +597,10 @@ pub fn draw(
         banner(f, f.area(), "⏸ paused — press space to resume".into(), t.warn);
     } else if err.is_some() {
         banner(f, f.area(), format!("⚠ {} — retrying…", err.clone().unwrap()), t.bad);
+    }
+
+    if show_help {
+        draw_help(f, f.area());
     }
 }
 
@@ -407,7 +611,7 @@ pub enum Page {
     Vllm,
 }
 
-// ── cluster page: hero strip + two graphs per node (vllm-top layout) ─
+// ── cluster page: hero strip + user-selected graphs per node ────────
 fn draw_cluster(
     f: &mut Frame,
     area: Rect,
@@ -416,6 +620,7 @@ fn draw_cluster(
     focused: usize,
     err: &Option<String>,
     window_secs: f64,
+    charts: &[ChartKind],
 ) {
     let t = theme();
     let n = order.len().max(1);
@@ -423,6 +628,7 @@ fn draw_cluster(
         std::iter::repeat(Constraint::Ratio(1, n as u32)).take(n),
     )
     .split(area);
+    let charts: &[ChartKind] = if charts.is_empty() { &[ChartKind::Gpu] } else { charts };
     for (i, name) in order.iter().enumerate() {
         let band = bands[i];
         let h = cluster.get(name);
@@ -464,37 +670,36 @@ fn draw_cluster(
         // hero cells
         let cells = hero_cells_for_node(s, d, t);
         let col_ws = [10u16, 10, 12, 9, 9, 12];
-        let mut x = rows[0].x;
-        for (ci, (label, lines)) in cells.iter().enumerate() {
-            if ci >= col_ws.len() {
-                break;
-            }
-            let w = col_ws[ci].min(rows[0].width.saturating_sub(x - rows[0].x));
-            let cell_area = Rect { x, width: w, ..rows[0] };
-            let mut ls = vec![Line::from(Span::styled(
-                label.to_lowercase(),
-                Style::new().fg(t.dim),
-            ))];
-            for l in lines {
-                ls.push(truncate_line(l.clone(), w as usize));
-            }
-            f.render_widget(Paragraph::new(ls), cell_area);
-            x += w;
+        render_hero(f, t, rows[0], &cells, &col_ws);
+        // user-selected graphs, evenly split
+        let n_charts = charts.len().max(1) as u32;
+        let cols = Layout::horizontal(
+            std::iter::repeat(Constraint::Ratio(1, n_charts)).take(charts.len().max(1)),
+        )
+        .split(rows[1]);
+        for (ci, kind) in charts.iter().enumerate() {
+            let (vals, dt) = chart_series(h, *kind);
+            let peak = vals.iter().filter_map(|v| *v).fold(0.0, f64::max);
+            draw_graph(
+                f,
+                t,
+                cols[ci],
+                kind.title(),
+                kind.gloss(),
+                &vals,
+                &dt,
+                window_secs,
+                chart_color(*kind, t),
+                chart_unit(*kind),
+                peak,
+                None,
+            );
         }
-        // graphs: gpu + net
-        let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
-        let gv = gpu_vals(h);
-        let (nv, ndt) = gaps(h, |d| d.net_rx_bps);
-        let gpu_peak = gv.iter().filter_map(|v| *v).fold(0.0, f64::max);
-        let net_peak = nv.iter().filter_map(|v| *v).fold(0.0, f64::max);
-        draw_graph(f, t, cols[0], "GPU", "compute", &gv, &ndt, window_secs, t.s3, "%", gpu_peak, None);
-        draw_graph(f, t, cols[1], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "B/s", net_peak, None);
-        let _ = ndt;
     }
 }
 
 // ── node page: btop-style full detail ────────────────────────────────
-fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>, window_secs: f64) {
+fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>, window_secs: f64, charts: &[ChartKind]) {
     let t = theme();
     let h = match name.and_then(|n| cluster.get(n)) {
         Some(h) if !h.samples.is_empty() => h,
@@ -503,113 +708,74 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     let (s, d) = h.last().unwrap();
 
     let rows = Layout::vertical([
-        Constraint::Length(2),      // hero strip
-        Constraint::Min(11),        // cpu graph + cores (graphs need height)
-        Constraint::Length(9),      // mem + gpu
-        Constraint::Length(9),      // net
-        Constraint::Length(7),      // disk + procs
+        Constraint::Length(2), // hero strip
+        Constraint::Min(10),   // big graphs row (cpu/mem/gpu)
+        Constraint::Length(9), // net + totals
+        Constraint::Length(7), // disk + procs
     ])
     .split(area);
 
     // hero strip
     let cells = hero_cells_for_node(s, d, t);
     let col_ws = [9u16, 9, 14, 8, 8, 13];
-    let mut x = rows[0].x;
-    for (ci, (label, lines)) in cells.iter().enumerate() {
-        if ci >= col_ws.len() {
-            break;
-        }
-        let w = col_ws[ci].min(rows[0].width.saturating_sub(x - rows[0].x));
-        let cell_area = Rect { x, width: w, ..rows[0] };
-        let mut ls = vec![Line::from(Span::styled(label.to_lowercase(), Style::new().fg(t.dim)))];
-        for l in lines {
-            ls.push(truncate_line(l.clone(), w as usize));
-        }
-        f.render_widget(Paragraph::new(ls), cell_area);
-        x += w;
+    render_hero(f, t, rows[0], &cells, &col_ws);
+
+    // big graphs row: CPU / memory / GPU equal thirds (btop-style balance),
+    // or the user's chart selection when customized
+    let defaults = [ChartKind::Cpu, ChartKind::Mem, ChartKind::Gpu];
+    let charts: &[ChartKind] = if charts.is_empty() { &defaults } else { charts };
+    let n = charts.len().max(1) as u32;
+    let big = Layout::horizontal(
+        std::iter::repeat(Constraint::Ratio(1, n)).take(charts.len().max(1)),
+    )
+    .split(rows[1]);
+    for (ci, kind) in charts.iter().enumerate() {
+        let (vals, dt) = chart_series(h, *kind);
+        let peak = vals.iter().filter_map(|v| *v).fold(0.0, f64::max);
+        let sub = match kind {
+            ChartKind::Cpu => Some(Line::from(Span::styled(
+                format!(
+                    " load {:.1}/{:.1}/{:.1} · {} running/{} total ",
+                    s.cpu.load1, s.cpu.load5, s.cpu.load15, s.cpu.procs_running, s.cpu.procs_total
+                ),
+                Style::new().fg(t.dim),
+            ))),
+            ChartKind::Gpu => match s.gpus.first() {
+                Some(g) => Some(Line::from(Span::styled(
+                    format!(" power {:.1}W · temp {:.0}°C · SM {:.0}MHz ", g.power_w, g.temp_c, g.sm_clock_mhz),
+                    Style::new().fg(t.dim),
+                ))),
+                None => Some(Line::from(Span::styled(" no GPU detected ", Style::new().fg(t.dim)))),
+            },
+            ChartKind::Mem => Some(Line::from(Span::styled(
+                format!(
+                    " used {:.1}GB of {:.1}GB · cached {:.1}GB ",
+                    s.mem.used_kb() as f64 / 1048576.0,
+                    s.mem.total_kb as f64 / 1048576.0,
+                    s.mem.cached_kb as f64 / 1048576.0
+                ),
+                Style::new().fg(t.dim),
+            ))),
+            _ => None,
+        };
+        draw_graph(
+            f,
+            t,
+            big[ci],
+            kind.title(),
+            kind.gloss(),
+            &vals,
+            &dt,
+            window_secs,
+            chart_color(*kind, t),
+            chart_unit(*kind),
+            peak,
+            sub,
+        );
     }
-
-    // cpu graph + per-core rows (btop)
-    let cpu_cols = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)]).split(rows[1]);
-    let (cv, cdt) = gaps(h, |d| d.cpu_pct);
-    let cpu_sub = Line::from(Span::styled(
-        format!(
-            " load {:.1}/{:.1}/{:.1} · {} running/{} total ",
-            s.cpu.load1, s.cpu.load5, s.cpu.load15, s.cpu.procs_running, s.cpu.procs_total
-        ),
-        Style::new().fg(t.dim),
-    ));
-    draw_graph(f, t, cpu_cols[0], "CPU", "aggregate", &cv, &cdt, window_secs, t.s1, "%", 100.0, Some(cpu_sub));
-
-    let core_block = block_titled(
-        Line::from(Span::styled(
-            format!(" cores ×{} ", s.cpu.cores.len().max(1)),
-            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-        )),
-        None,
-        t,
-    );
-    let core_inner = core_block.inner(cpu_cols[1]);
-    f.render_widget(core_block, cpu_cols[1]);
-    let half = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(core_inner);
-    let per_col = half[0].height as usize;
-    for (ci, chunk) in half.iter().enumerate() {
-        let mut lines = Vec::new();
-        for r in 0..per_col {
-            let i = ci * per_col + r;
-            if i >= s.cpu.cores.len() {
-                break;
-            }
-            let pct = d.per_core_pct.get(i).copied().unwrap_or(0.0);
-            let bars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-            let b = bars[(((pct / 100.0) * 7.999).round() as usize).min(7)];
-            lines.push(Line::from(vec![
-                Span::styled(format!("C{i:<2} "), Style::new().fg(t.dim)),
-                Span::styled(b, Style::new().fg(usage_color(t, pct / 100.0))),
-                Span::styled(format!(" {:>3.0}%", pct), Style::new().fg(usage_color(t, pct / 100.0))),
-            ]));
-        }
-        f.render_widget(Paragraph::new(lines), *chunk);
-    }
-
-    // memory + gpu row
-    let mg_cols = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[2]);
-    let mem_block = block_titled(
-        Line::from(Span::styled(
-            " memory ",
-            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-        )),
-        Some(Line::from(Span::styled(" unified — CPU and GPU share one pool ", Style::new().fg(t.dim)))),
-        t,
-    );
-    let mem_inner = mem_block.inner(mg_cols[0]);
-    f.render_widget(mem_block, mg_cols[0]);
-    let total_gb = s.mem.total_kb as f64 / 1048576.0;
-    let used_frac = if s.mem.total_kb > 0 { s.mem.used_kb() as f64 / s.mem.total_kb as f64 } else { 0.0 };
-    let mem_kvs = vec![
-        Kv::plain("total", format!("{:.1} GB", total_gb), "LPDDR5X"),
-        Kv::colored("used", format!("{:.1} GB", s.mem.used_kb() as f64 / 1048576.0), &format!("{:.0}%", used_frac * 100.0), usage_color(t, used_frac)),
-        Kv::plain("cached", format!("{:.1} GB", s.mem.cached_kb as f64 / 1048576.0), "page cache"),
-        Kv::plain("avail", format!("{:.1} GB", s.mem.avail_kb as f64 / 1048576.0), "reclaimable"),
-    ];
-    f.render_widget(
-        Paragraph::new(kv_lines(t, mem_kvs, mem_inner.width as usize)),
-        mem_inner,
-    );
-
-    let gpu = s.gpus.first();
-    let (gv2, gdt) = (gpu_vals(h), h.samples.windows(2).map(|w| ((w[1].t_unix_us - w[0].t_unix_us) as f64 / 1e6).clamp(0.1, 60.0)).collect::<Vec<f64>>());
-    let gpu_sub = match gpu {
-        Some(g) => Line::from(Span::styled(
-            format!(" power {:.1}W · temp {:.0}°C · SM {:.0}MHz ", g.power_w, g.temp_c, g.sm_clock_mhz),
-            Style::new().fg(t.dim),
-        )),
-        None => Line::from(Span::styled(" no GPU detected ", Style::new().fg(t.dim))),
-    };
-    draw_graph(f, t, mg_cols[1], "GPU", "compute", &gv2, &gdt, window_secs, t.s3, "%", 100.0, Some(gpu_sub));
 
     // net row
-    let net_cols = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).split(rows[3]);
+    let net_cols = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).split(rows[2]);
     let (nv, ndt) = gaps(h, |d| d.net_rx_bps);
     let net_sub = Line::from(Span::styled(
         format!(" ↑ now {} ", fmt_bps(d.net_tx_bps)),
@@ -641,7 +807,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     f.render_widget(Paragraph::new(kv_lines(t, net_kvs, net_inner.width as usize)), net_inner);
 
     // disk + gpu processes
-    let dp_cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[4]);
+    let dp_cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[3]);
     let (dv, ddt) = gaps(h, |d| d.disk_read_bps);
     let disk_peak = dv.iter().filter_map(|v| *v).fold(0.0, f64::max);
     let disk_sub = Line::from(Span::styled(
@@ -657,7 +823,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     );
     let proc_inner = proc_block.inner(dp_cols[1]);
     f.render_widget(proc_block, dp_cols[1]);
-    let procs = gpu.map(|g| g.pids.as_slice()).unwrap_or(&[]);
+    let procs = s.gpus.first().map(|g| g.pids.as_slice()).unwrap_or(&[]);
     let mut proc_kvs = Vec::new();
     if procs.is_empty() {
         proc_kvs.push(Kv::gloss_only("none — no compute jobs".into()));
@@ -738,20 +904,7 @@ fn draw_vllm(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         ),
     ];
     let col_ws = [12u16, 12, 22, 14, 14, 18];
-    let mut x = rows[0].x;
-    for (ci, (label, lines)) in cells.iter().enumerate() {
-        if ci >= col_ws.len() {
-            break;
-        }
-        let w = col_ws[ci].min(rows[0].width.saturating_sub(x - rows[0].x));
-        let cell_area = Rect { x, width: w, ..rows[0] };
-        let mut ls = vec![Line::from(Span::styled(label.to_lowercase(), Style::new().fg(t.dim)))];
-        for l in lines {
-            ls.push(truncate_line(l.clone(), w as usize));
-        }
-        f.render_widget(Paragraph::new(ls), cell_area);
-        x += w;
-    }
+    render_hero(f, t, rows[0], &cells, &col_ws);
 
     // prefill / decode graphs (the centerpiece)
     let chart_cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
@@ -783,7 +936,7 @@ fn draw_vllm(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     f.render_widget(Paragraph::new(kv_lines(t, lat_kvs, lat_inner.width as usize)), lat_inner);
 
     let ttft_data: Vec<Option<f64>> = h.derived.iter().map(|dd| dd.ttft_p50.map(|v| v * 1000.0)).collect();
-    let tdt: Vec<f64> = h.samples.windows(2).map(|w| ((w[1].t_unix_us - w[0].t_unix_us) as f64 / 1e6).clamp(0.1, 60.0)).collect();
+    let tdt = dt_of(h);
     let ttft_peak = ttft_data.iter().filter_map(|v| *v).fold(0.0, f64::max);
     draw_graph(f, t, lat_cols[1], "TTFT p50", "time to first token", &ttft_data, &tdt, window_secs, t.s3, "ms", ttft_peak, None);
     let tpot_data: Vec<Option<f64>> = h.derived.iter().map(|dd| dd.tpot_p50.map(|v| v * 1000.0)).collect();
