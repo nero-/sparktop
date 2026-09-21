@@ -45,6 +45,19 @@ pub enum ChartKind {
     Load,
 }
 
+/// Default chart sets per page — single source of truth for draw fallbacks,
+/// `c` reset, and the `e` seed when the selection is empty.
+pub const DEFAULTS_CLUSTER: [ChartKind; 3] = [ChartKind::Gpu, ChartKind::Mem, ChartKind::Net];
+pub const DEFAULTS_NODE: [ChartKind; 3] = [ChartKind::Cpu, ChartKind::Mem, ChartKind::Gpu];
+
+pub fn defaults_for(page: Page) -> &'static [ChartKind] {
+    match page {
+        Page::Cluster => &DEFAULTS_CLUSTER,
+        Page::Node => &DEFAULTS_NODE,
+        Page::Vllm => &[],
+    }
+}
+
 impl ChartKind {
     pub fn title(self) -> &'static str {
         match self {
@@ -104,9 +117,11 @@ fn chart_color(kind: ChartKind, t: &Theme) -> ratatui::style::Color {
         ChartKind::Gpu => t.s3,
         ChartKind::Mem => t.warn,
         ChartKind::Cpu => t.s1,
-        ChartKind::Net => t.s1,
+        // net must not share the CPU green: they end up adjacent when the
+        // user builds a full row
+        ChartKind::Net => t.accent,
         ChartKind::Disk => t.s2,
-        ChartKind::Load => t.accent,
+        ChartKind::Load => t.bad,
     }
 }
 
@@ -446,7 +461,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             " keys ",
             Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
         )),
-        Some(Line::from(Span::styled(" press ? or esc to close ", Style::new().fg(t.dim)))),
+        Some(Line::from(Span::styled(" esc closes help — esc again quits ", Style::new().fg(t.dim)))),
         t,
     );
     f.render_widget(block, popup);
@@ -466,11 +481,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(" e         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("add next chart to this page (pages 1+2)", Style::new().fg(t.fg)),
+            Span::styled("add next chart (max 6; pages 1+2)", Style::new().fg(t.fg)),
         ]),
         Line::from(vec![
             Span::styled(" r         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("remove last chart from this page (pages 1+2)", Style::new().fg(t.fg)),
+            Span::styled("remove last chart (pages 1+2)", Style::new().fg(t.fg)),
         ]),
         Line::from(vec![
             Span::styled(" c         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
@@ -483,6 +498,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled(" t         ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
             Span::styled("theme: gruvbox → catppuccin → tokyonight", Style::new().fg(t.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(" tab/⇧tab  ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("next / previous node", Style::new().fg(t.fg)),
         ]),
         Line::from(vec![
             Span::styled(" q / esc   ", Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
@@ -523,6 +542,7 @@ pub fn draw(
     cluster_charts: &[ChartKind],
     node_charts: &[ChartKind],
     show_help: bool,
+    status: &Option<(String, std::time::Instant)>,
 ) {
     let t = theme();
     f.render_widget(Block::new().style(Style::new().bg(t.bg)), f.area());
@@ -566,7 +586,7 @@ pub fn draw(
     if let Some(e) = err {
         spans.push(Span::styled(format!(" · ⚠ {e}"), Style::new().fg(t.bad)));
     }
-    let hints = "[1/2/3 · tab node · w window · e add chart · r rm · ? help · q quit]";
+    let hints = "[1/2/3 · tab node · space pause · w window · e add · r rm chart · c reset · t theme · ? help · q quit]";
     spans.push(Span::styled(format!("  {hints}"), Style::new().fg(t.dim)));
     // keep the full hint readable: drop earlier spans before cutting mid-word
     let width = f.area().width as usize;
@@ -597,6 +617,11 @@ pub fn draw(
         banner(f, f.area(), "⏸ paused — press space to resume".into(), t.warn);
     } else if err.is_some() {
         banner(f, f.area(), format!("⚠ {} — retrying…", err.clone().unwrap()), t.bad);
+    } else if let Some((msg, at)) = status {
+        // transient no-op feedback: show for 2s then drop
+        if at.elapsed() < std::time::Duration::from_secs(2) {
+            banner(f, f.area(), msg.clone(), t.dim);
+        }
     }
 
     if show_help {
@@ -628,7 +653,7 @@ fn draw_cluster(
         std::iter::repeat(Constraint::Ratio(1, n as u32)).take(n),
     )
     .split(area);
-    let charts: &[ChartKind] = if charts.is_empty() { &[ChartKind::Gpu] } else { charts };
+    let charts: &[ChartKind] = if charts.is_empty() { &DEFAULTS_CLUSTER } else { charts };
     for (i, name) in order.iter().enumerate() {
         let band = bands[i];
         let h = cluster.get(name);
@@ -722,8 +747,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
 
     // big graphs row: CPU / memory / GPU equal thirds (btop-style balance),
     // or the user's chart selection when customized
-    let defaults = [ChartKind::Cpu, ChartKind::Mem, ChartKind::Gpu];
-    let charts: &[ChartKind] = if charts.is_empty() { &defaults } else { charts };
+    let charts: &[ChartKind] = if charts.is_empty() { &DEFAULTS_NODE } else { charts };
     let n = charts.len().max(1) as u32;
     let big = Layout::horizontal(
         std::iter::repeat(Constraint::Ratio(1, n)).take(charts.len().max(1)),
@@ -782,7 +806,7 @@ fn draw_node(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         Style::new().fg(t.dim),
     ));
     let net_peak = nv.iter().filter_map(|v| *v).fold(0.0, f64::max);
-    draw_graph(f, t, net_cols[0], "network ↓", "receive", &nv, &ndt, window_secs, t.s1, "B/s", net_peak, Some(net_sub));
+    draw_graph(f, t, net_cols[0], "network ↓", "receive", &nv, &ndt, window_secs, t.accent, "B/s", net_peak, Some(net_sub));
 
     let tot_rx: u64 = s.net.values().map(|n| n.rx_bytes).sum();
     let tot_tx: u64 = s.net.values().map(|n| n.tx_bytes).sum();

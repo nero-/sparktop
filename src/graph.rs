@@ -65,18 +65,10 @@ pub fn mini_line_graph(
         return;
     }
     // all-None (no successful poll yet) or all-zero: render an idle gloss
-    // instead of a misleading blank panel
+    // INSTEAD of a fill, but keep the gridlines so % panels keep their
+    // 0–100 scale context alongside their neighbors
     let has_data = vals.iter().any(|v| v.map(|v| v > 0.0).unwrap_or(false));
-    if vals.iter().all(|v| v.is_none()) || (!has_data && vals.iter().all(|v| v.is_some())) {
-        let row = Rect { y: area.y + area.height / 2, height: 1, ..area };
-        f.render_widget(
-            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
-                ratatui::text::Span::styled(" idle ", ratatui::style::Style::new().fg(dim)),
-            )),
-            row,
-        );
-        return;
-    }
+    let is_idle = vals.iter().all(|v| v.is_none()) || (!has_data && vals.iter().all(|v| v.is_some()));
     // single sample with no dt yet: seed a nominal interval so the newest
     // value renders instead of a blank panel for the first second
     let dt: Vec<f64> = if dt.is_empty() && !vals.is_empty() {
@@ -87,6 +79,9 @@ pub fn mini_line_graph(
     let w_dots = (area.width as f64) * 2.0;
     let h_dots = (area.height as f64) * 4.0;
     let span: f64 = dt.iter().sum::<f64>();
+    // young session on a long window: say so, or the mostly-empty plot
+    // reads as broken
+    let collecting = span < window_secs / 4.0 && !is_idle;
     let axis_x = |cum: f64| {
         ((w_dots - 1.0) - (span - cum) / window_secs * (w_dots - 1.0)).clamp(0.0, w_dots - 1.0)
     };
@@ -97,7 +92,9 @@ pub fn mini_line_graph(
         let cx = axis_x(x);
         if let Some(v) = v {
             let h = ((v / ymax_of(ref_lines, window_secs)) * h_dots * 0.96).min(h_dots * 0.96);
-            tops.push((i, cx, h));
+            if !is_idle {
+                tops.push((i, cx, h));
+            }
         }
         x += dt.get(i).copied().unwrap_or(1.0);
     }
@@ -191,8 +188,11 @@ pub fn mini_line_graph(
                     x += 5.0;
                 }
             }
-            for (y, text) in &labels {
-                ctx.print(2.0, *y, Span::styled(text.clone(), Style::new().fg(dim)));
+            // labels overlap the fill on narrow panels — skip below 16 cols
+            if area.width >= 16 {
+                for (y, text) in &labels {
+                    ctx.print(2.0, *y, Span::styled(text.clone(), Style::new().fg(dim)));
+                }
             }
             for (cx, h) in &cols {
                 ctx.draw(&CLine { x1: *cx, y1: 0.0, x2: *cx, y2: *h, color });
@@ -204,6 +204,29 @@ pub fn mini_line_graph(
             }
         });
     f.render_widget(canvas, area);
+    if is_idle {
+        let row = Rect { y: area.y + area.height / 2, height: 1, ..area };
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                ratatui::text::Span::styled(" idle ", Style::new().fg(dim)),
+            )),
+            row,
+        );
+    } else if collecting {
+        let secs = span as u64;
+        let label = if secs >= 60 {
+            format!(" collecting — {}m of {}", secs / 60, crate::ui::window_label(window_secs))
+        } else {
+            format!(" collecting — {secs}s of {}", crate::ui::window_label(window_secs))
+        };
+        let row = Rect { y: area.y + area.height / 2, height: 1, ..area };
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(
+                ratatui::text::Span::styled(label, Style::new().fg(dim)),
+            )),
+            row,
+        );
+    }
 }
 
 fn ymax_of(ref_lines: &[f64], _window_secs: f64) -> f64 {

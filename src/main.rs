@@ -135,6 +135,8 @@ fn main() -> anyhow::Result<()> {
     ];
     let mut node_charts: Vec<sparktop::ui::ChartKind> = Vec::new(); // defaults: cpu/mem/gpu
     let mut show_help = false;
+    // transient status for no-op keys (e/r/c feedback): (message, set-at)
+    let status: Arc<Mutex<Option<(String, std::time::Instant)>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = std::sync::mpsc::channel::<crossterm::event::Event>();
     std::thread::spawn(move || {
         loop {
@@ -162,6 +164,7 @@ fn main() -> anyhow::Result<()> {
                 &cluster_charts,
                 &node_charts,
                 show_help,
+                &status.lock(),
             );
         })?;
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
@@ -185,32 +188,61 @@ fn main() -> anyhow::Result<()> {
                             window_idx = (window_idx + 1) % sparktop::ui::WINDOWS.len();
                         }
                         Char('e') => {
-                            // add the next chart kind not already shown
-                            let charts = match page {
-                                Page::Cluster => &mut cluster_charts,
-                                Page::Node => &mut node_charts,
-                                Page::Vllm => continue,
+                            // add the next chart kind not already shown;
+                            // no-op when all six kinds are already present
+                            // (the ring would otherwise loop forever)
+                            let (charts, skip) = match page {
+                                Page::Cluster => (&mut cluster_charts, vec![]),
+                                // node page always renders net+disk rows below,
+                                // so skip those kinds when choosing what to add
+                                Page::Node => (&mut node_charts, vec![sparktop::ui::ChartKind::Net, sparktop::ui::ChartKind::Disk]),
+                                Page::Vllm => {
+                                    *status.lock() = Some(("chart keys apply to pages 1–2".to_string(), std::time::Instant::now()));
+                                    continue;
+                                }
                             };
-                            let mut next = charts.last().copied().unwrap_or(sparktop::ui::ChartKind::Net).next();
-                            while charts.contains(&next) {
+                            if charts.len() >= 6 {
+                                *status.lock() = Some(("page full — 6/6 charts (r to remove)".to_string(), std::time::Instant::now()));
+                                continue;
+                            }
+                            // seed from the page's first default when empty, so
+                            // re-adding rebuilds toward the defaults (Gpu on
+                            // cluster, Cpu on node) instead of a lone Disk
+                            let seed = charts
+                                .last()
+                                .copied()
+                                .or_else(|| sparktop::ui::defaults_for(page).first().copied())
+                                .unwrap_or(sparktop::ui::ChartKind::Net);
+                            let mut next = seed.next();
+                            while charts.contains(&next) || skip.contains(&next) {
                                 next = next.next();
                             }
                             charts.push(next);
+                            status.lock().take();
                         }
                         Char('r') => {
                             let charts = match page {
                                 Page::Cluster => &mut cluster_charts,
                                 Page::Node => &mut node_charts,
-                                Page::Vllm => continue,
+                                Page::Vllm => {
+                                    *status.lock() = Some(("chart keys apply to pages 1–2".to_string(), std::time::Instant::now()));
+                                    continue;
+                                }
                             };
-                            charts.pop();
+                            match charts.pop() {
+                                Some(_) => {
+                                    status.lock().take();
+                                }
+                                None => *status.lock() = Some(("nothing to remove — page shows defaults".to_string(), std::time::Instant::now())),
+                            }
                         }
                         Char('c') => {
                             match page {
-                                Page::Cluster => cluster_charts = vec![sparktop::ui::ChartKind::Gpu, sparktop::ui::ChartKind::Mem, sparktop::ui::ChartKind::Net],
+                                Page::Cluster => cluster_charts = sparktop::ui::DEFAULTS_CLUSTER.to_vec(),
                                 Page::Node => node_charts = Vec::new(), // defaults
                                 Page::Vllm => {}
                             }
+                            status.lock().take();
                         }
                         Char('?') => show_help = !show_help,
                         Tab => focused = (focused + 1) % node_names.len().max(1),
