@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
 
     while running {
         terminal.draw(|f| {
-            sparktop::ui::draw(f, &cluster.lock(), &node_names, page, focused, PAUSED.load(Ordering::Relaxed), interval, &last_err.lock());
+            sparktop::ui::draw(f, &cluster.lock(), &node_names, page, focused, PAUSED.load(Ordering::Relaxed), interval, &last_err.lock(), 60.0);
         })?;
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if let crossterm::event::Event::Key(k) = ev {
@@ -141,6 +141,9 @@ fn main() -> anyhow::Result<()> {
                         Char('1') => page = Page::Cluster,
                         Char('2') => page = Page::Node,
                         Char('3') => page = Page::Vllm,
+                        Char('t') => {
+                            sparktop::ui::THEME_IDX.fetch_add(1, Ordering::Relaxed);
+                        }
                         Tab => focused = (focused + 1) % node_names.len().max(1),
                         BackTab => focused = focused.checked_sub(1).unwrap_or(node_names.len().saturating_sub(1)),
                         _ => {}
