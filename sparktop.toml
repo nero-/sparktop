@@ -6,7 +6,9 @@ interval = 1.0
 name = "spark-r0"
 host = "192.168.50.219"
 user = "nero"
-vllm_url = "http://192.168.50.219:8000/v1"   # uncomment when vLLM runs on this node
+# vLLM metrics: scraped from the node itself (must be reachable from the node,
+# so localhost works even if the port isn't exposed externally)
+vllm_url = "http://localhost:8000"
 
 # Tomorrow's second node — uncomment when it's up:
 # [[nodes]]

@@ -279,7 +279,9 @@ pub fn parse_prometheus(text: &str) -> VllmMetrics {
             "vllm:generation_tokens_total" => m.generation_tps = v,
             "vllm:num_requests_running" => m.running = v as u64,
             "vllm:num_requests_waiting" => m.waiting = v as u64,
-            "vllm:gpu_cache_usage_perc" => m.gpu_cache_usage = v,
+            // cache usage: newer vLLM exposes a single kv_cache_usage_perc
+            // (no CPU offload tier); older splits gpu_/cpu_
+            "vllm:kv_cache_usage_perc" | "vllm:gpu_cache_usage_perc" => m.gpu_cache_usage = v,
             "vllm:cpu_cache_usage_perc" => m.cpu_cache_usage = v,
             "vllm:time_to_first_token_seconds_bucket" => {
                 if let Some(le) = label("le") {
@@ -287,7 +289,10 @@ pub fn parse_prometheus(text: &str) -> VllmMetrics {
                     bucket_push(&mut m.ttft_buckets, le, v);
                 }
             }
-            "vllm:time_per_output_token_seconds_bucket" => {
+            // TPOT histogram: "time_per_output_token_seconds" on older
+            // vLLM, "inter_token_latency_seconds" on newer
+            "vllm:time_per_output_token_seconds_bucket"
+            | "vllm:inter_token_latency_seconds_bucket" => {
                 if let Some(le) = label("le") {
                     let le: f64 = if le == "+Inf" { f64::INFINITY } else { le.parse().unwrap_or(0.0) };
                     bucket_push(&mut m.tpot_buckets, le, v);
