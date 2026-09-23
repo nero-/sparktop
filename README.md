@@ -16,9 +16,9 @@ cargo build --release
 interval = 1.0
 
 [[nodes]]
-name = "spark-r0"
-host = "192.168.50.219"
-user = "nero"
+name = "hostname"
+host = "host_ip"
+user = "user"
 # vllm_url = "http://localhost:8000"   # scrape vLLM /metrics from the node
 ```
 Add nodes by appending `[[nodes]]` blocks. Polling is agentless SSH — nothing
