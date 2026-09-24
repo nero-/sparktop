@@ -1,9 +1,8 @@
-//! Ring-buffer history per node plus derived rates (CPU%, net B/s, tok/s,
-//! disk IOPS). Delta math lives here, not in the UI.
-use crate::sample::Sample;
+//! Timestamp-based rates and rolling, time-weighted display statistics.
+use crate::sample::{Sample, VllmMetrics};
 use std::collections::HashMap;
 
-pub const HISTORY_CAP: usize = 900; // ~15 min at 1s
+pub const HISTORY_CAP: usize = 1801; // at least 15 minutes at the fastest 0.5s poll
 
 #[derive(Debug, Clone, Default)]
 pub struct Derived {
@@ -17,6 +16,11 @@ pub struct Derived {
     pub disk_write_bps: f64,
     pub prompt_tps: f64,
     pub generation_tps: f64,
+    pub prompt_smooth: f64,
+    pub generation_smooth: f64,
+    pub prompt_avg30: f64,
+    pub generation_avg30: f64,
+    pub token_interval_s: f64,
     pub ttft_p50: Option<f64>,
     pub ttft_p95: Option<f64>,
     pub tpot_p50: Option<f64>,
@@ -24,31 +28,21 @@ pub struct Derived {
 }
 
 pub struct NodeHistory {
-    pub samples: Vec<Sample>,  // ring buffer as vec, front trimmed
-    pub derived: Vec<Derived>, // parallel to samples
-    /// last cumulative counters for delta computation
+    pub samples: Vec<Sample>,
+    pub derived: Vec<Derived>,
     prev_cpu: (u64, u64),
     prev_cores: Vec<(u64, u64)>,
     prev_net: HashMap<String, (u64, u64)>,
     prev_disk: HashMap<String, (u64, u64)>,
-    prev_tokens: (f64, f64),
-    prev_ttft: Vec<(f64, f64)>,
-    prev_tpot: Vec<(f64, f64)>,
+    prev_time: Option<u64>,
+    prev_vllm: Option<(u64, VllmMetrics)>,
 }
 
 impl NodeHistory {
     pub fn new() -> Self {
-        Self {
-            samples: Vec::with_capacity(HISTORY_CAP),
-            derived: Vec::with_capacity(HISTORY_CAP),
-            prev_cpu: (0, 0),
-            prev_cores: Vec::new(),
-            prev_net: HashMap::new(),
-            prev_disk: HashMap::new(),
-            prev_tokens: (0.0, 0.0),
-            prev_ttft: Vec::new(),
-            prev_tpot: Vec::new(),
-        }
+        Self { samples: Vec::new(), derived: Vec::new(), prev_cpu: (0,0),
+            prev_cores: Vec::new(), prev_net: HashMap::new(), prev_disk: HashMap::new(),
+            prev_time: None, prev_vllm: None }
     }
 
     pub fn push(&mut self, s: Sample) {
@@ -56,182 +50,147 @@ impl NodeHistory {
         self.samples.push(s);
         self.derived.push(d);
         if self.samples.len() > HISTORY_CAP {
-            self.samples.remove(0);
-            self.derived.remove(0);
+            self.samples.remove(0); self.derived.remove(0);
         }
+        let p5 = self.token_average(5.0, |d| d.prompt_tps);
+        let g5 = self.token_average(5.0, |d| d.generation_tps);
+        let p30 = self.token_average(30.0, |d| d.prompt_tps);
+        let g30 = self.token_average(30.0, |d| d.generation_tps);
+        let d = self.derived.last_mut().unwrap();
+        d.prompt_smooth = if d.prompt_tps.is_finite() { p5 } else { f64::NAN };
+        d.generation_smooth = if d.generation_tps.is_finite() { g5 } else { f64::NAN };
+        d.prompt_avg30 = if d.prompt_tps.is_finite() { p30 } else { f64::NAN };
+        d.generation_avg30 = if d.generation_tps.is_finite() { g30 } else { f64::NAN };
+    }
+
+    /// Weight only the portion of each valid measurement inside the window.
+    pub fn token_average(&self, seconds: f64, value: impl Fn(&Derived)->f64) -> f64 {
+        let Some(last) = self.samples.last() else { return f64::NAN };
+        let end = last.rate_time_us() as f64 / 1e6;
+        let start = end - seconds;
+        let (mut tokens, mut duration) = (0.0, 0.0);
+        for (s,d) in self.samples.iter().zip(&self.derived).rev() {
+            let t = s.rate_time_us() as f64 / 1e6;
+            if t <= start { break; }
+            let rate = value(d);
+            if !rate.is_finite() && d.token_interval_s > 0.0 { break; }
+            let overlap = (t - (t-d.token_interval_s).max(start)).max(0.0);
+            if rate.is_finite() && overlap > 0.0 {
+                tokens += rate*overlap; duration += overlap;
+            }
+        }
+        if duration > 0.0 { tokens/duration } else { f64::NAN }
     }
 
     fn derive(&mut self, s: &Sample) -> Derived {
-        let mut d = Derived::default();
-
-        d.mem_used_pct = if s.mem.total_kb > 0 {
-            100.0 * s.mem.used_kb() as f64 / s.mem.total_kb as f64
-        } else {
-            0.0
-        };
+        let mut d = Derived { prompt_tps: f64::NAN, generation_tps: f64::NAN,
+            net_rx_bps: f64::NAN, net_tx_bps: f64::NAN,
+            disk_read_bps: f64::NAN, disk_write_bps: f64::NAN, ..Default::default() };
+        let now = s.rate_time_us();
+        let dt = self.prev_time.and_then(|p| now.checked_sub(p)).filter(|t| *t > 0).map(|t| t as f64 / 1e6);
+        d.mem_used_pct = if s.mem.total_kb > 0 { 100.0*s.mem.used_kb() as f64/s.mem.total_kb as f64 } else { 0.0 };
         d.load1 = s.cpu.load1;
-
-        // CPU
-        if self.prev_cpu.1 > 0 && s.cpu.all.1 > self.prev_cpu.1 {
-            let dt = (s.cpu.all.1 - self.prev_cpu.1) as f64;
-            d.cpu_pct = 100.0 * (dt - (s.cpu.all.0 - self.prev_cpu.0) as f64) / dt;
+        d.cpu_pct = cpu_percent(self.prev_cpu, s.cpu.all);
+        d.per_core_pct = s.cpu.cores.iter().enumerate().map(|(i,c)|
+            self.prev_cores.get(i).map(|p| cpu_percent(*p,*c)).unwrap_or(0.0)).collect();
+        self.prev_cpu=s.cpu.all; self.prev_cores=s.cpu.cores.clone();
+        let net: HashMap<_,_> = s.net.iter().filter(|(n,_)| *n!="lo" && !n.starts_with("docker") && !n.starts_with("veth"))
+            .map(|(n,v)| (n.clone(),(v.rx_bytes,v.tx_bytes))).collect();
+        let disk: HashMap<_,_> = s.disks.iter().filter(|(n,_)| whole_disk(n))
+            .map(|(n,v)| (n.clone(),(v.read_bytes,v.write_bytes))).collect();
+        if let Some(dt)=dt {
+            d.net_rx_bps=device_rate(&self.prev_net,&net,0,dt);
+            d.net_tx_bps=device_rate(&self.prev_net,&net,1,dt);
+            d.disk_read_bps=device_rate(&self.prev_disk,&disk,0,dt);
+            d.disk_write_bps=device_rate(&self.prev_disk,&disk,1,dt);
         }
-        for (i, (idle, total)) in s.cpu.cores.iter().enumerate() {
-            if let Some((pidle, ptotal)) = self.prev_cores.get(i) {
-                if *ptotal > 0 && total > ptotal {
-                    let dt = (total - ptotal) as f64;
-                    d.per_core_pct
-                        .push(100.0 * (dt - (idle - pidle) as f64) / dt);
-                    continue;
+        self.prev_net=net; self.prev_disk=disk; self.prev_time=Some(now);
+        if let Some(v)=&s.vllm {
+            if let Some((t,prev))=&self.prev_vllm {
+                if let Some(delta)=now.checked_sub(*t).filter(|x| *x>0) {
+                    let dt=delta as f64/1e6; d.token_interval_s=dt;
+                    d.prompt_tps=counter_delta(prev,v,"vllm:prompt_tokens_total").map(|x| x/dt).unwrap_or(f64::NAN);
+                    d.generation_tps=counter_delta(prev,v,"vllm:generation_tokens_total").map(|x| x/dt).unwrap_or(f64::NAN);
+                    if counter_delta(prev,v,"vllm:time_to_first_token_seconds_bucket").is_some() {
+                        if let Some((p50,p95))=histogram_pcts(&prev.ttft_buckets,&v.ttft_buckets) { d.ttft_p50=p50;d.ttft_p95=p95; }
+                    }
+                    let metric=if v.raw.keys().any(|k| k.starts_with("vllm:inter_token_latency_seconds_bucket[")) {
+                        "vllm:inter_token_latency_seconds_bucket"
+                    } else { "vllm:time_per_output_token_seconds_bucket" };
+                    if counter_delta(prev,v,metric).is_some() {
+                        if let Some((p50,p95))=histogram_pcts(&prev.tpot_buckets,&v.tpot_buckets) { d.tpot_p50=p50;d.tpot_p95=p95; }
+                    }
                 }
             }
-            d.per_core_pct.push(0.0);
+            self.prev_vllm=Some((now,v.clone()));
         }
-        self.prev_cpu = s.cpu.all;
-        self.prev_cores = s.cpu.cores.clone();
-
-        // Network: sum physical + RDMA-capable links; skip lo
-        let mut rx = 0u64;
-        let mut tx = 0u64;
-        for (iface, dev) in &s.net {
-            if iface == "lo" || iface.starts_with("docker") || iface.starts_with("veth") {
-                continue;
-            }
-            rx += dev.rx_bytes;
-            tx += dev.tx_bytes;
-        }
-        let prev_net_rx = self.prev_net.values().map(|v| v.0).sum::<u64>();
-        let prev_net_tx = self.prev_net.values().map(|v| v.1).sum::<u64>();
-        if prev_net_rx > 0 && rx > prev_net_rx {
-            d.net_rx_bps = (rx - prev_net_rx) as f64;
-            d.net_tx_bps = (tx - prev_net_tx) as f64;
-        }
-        self.prev_net = s
-            .net
-            .iter()
-            .filter(|(i, _)| *i != "lo" && !i.starts_with("docker") && !i.starts_with("veth"))
-            .map(|(i, dev)| (i.clone(), (dev.rx_bytes, dev.tx_bytes)))
-            .collect();
-
-        // Disk: sum whole disks, skip partitions and loop/ram devices.
-        // Whole disks: nvme\d+n\d+ (nvme0n1), mmcblk\d+; partitions end in
-        // p<digits> (nvme0n1p1) or are sd/vd/hd + digit.
-        let is_partition = |name: &str| -> bool {
-            if let Some(pos) = name.rfind('p') {
-                if name[pos + 1..].bytes().all(|c| c.is_ascii_digit())
-                    && !name[pos + 1..].is_empty()
-                {
-                    // nvme0n1p1 / mmcblk0p2 — but not a whole disk named e.g. "p1"
-                    return pos > 0;
-                }
-            }
-            (name.starts_with("sd") || name.starts_with("vd") || name.starts_with("hd"))
-                && name[2..].bytes().all(|c| c.is_ascii_digit())
-        };
-        let mut dr = 0u64;
-        let mut dw = 0u64;
-        for (name, dev) in &s.disks {
-            if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
-                continue;
-            }
-            if is_partition(name) {
-                continue;
-            }
-            dr += dev.read_bytes;
-            dw += dev.write_bytes;
-        }
-        // keep the same filter on both sides of the delta, or the difference
-        // undercounts by cumulative partition bytes
-        let prev_dr: u64 = self
-            .prev_disk
-            .iter()
-            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
-            .map(|(_, v)| v.0)
-            .sum();
-        let prev_dw: u64 = self
-            .prev_disk
-            .iter()
-            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
-            .map(|(_, v)| v.1)
-            .sum();
-        if prev_dr > 0 && dr > prev_dr {
-            d.disk_read_bps = (dr - prev_dr) as f64;
-            d.disk_write_bps = (dw - prev_dw) as f64;
-        }
-        self.prev_disk = s
-            .disks
-            .iter()
-            .filter(|(n, _)| !is_partition(n) && !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
-            .map(|(n, v)| (n.clone(), (v.read_bytes, v.write_bytes)))
-            .collect();
-
-        // vLLM token rates from cumulative counters
-        if let Some(v) = &s.vllm {
-            if self.prev_tokens.0 > 0.0 && v.prompt_tps > self.prev_tokens.0 {
-                d.prompt_tps = v.prompt_tps - self.prev_tokens.0;
-            }
-            if self.prev_tokens.1 > 0.0 && v.generation_tps > self.prev_tokens.1 {
-                d.generation_tps = v.generation_tps - self.prev_tokens.1;
-            }
-            if let Some((p50, p95)) = histogram_pcts(&self.prev_ttft, &v.ttft_buckets) {
-                d.ttft_p50 = p50;
-                d.ttft_p95 = p95;
-            }
-            if let Some((p50, p95)) = histogram_pcts(&self.prev_tpot, &v.tpot_buckets) {
-                d.tpot_p50 = p50;
-                d.tpot_p95 = p95;
-            }
-            self.prev_tokens = (v.prompt_tps, v.generation_tps);
-            self.prev_ttft = v.ttft_buckets.clone();
-            self.prev_tpot = v.tpot_buckets.clone();
-        }
-
         d
     }
-
-    pub fn last(&self) -> Option<(&Sample, &Derived)> {
-        let i = self.samples.len().checked_sub(1)?;
-        Some((&self.samples[i], &self.derived[i]))
+    pub fn last(&self) -> Option<(&Sample,&Derived)> {
+        self.samples.last().zip(self.derived.last())
     }
 }
 
-/// Compute p50/p95 from cumulative histogram bucket deltas between two
-/// snapshots of the same histogram. Returns None if no observations happened.
-fn histogram_pcts(
-    prev: &[(f64, f64)],
-    cur: &[(f64, f64)],
-) -> Option<(Option<f64>, Option<f64>)> {
-    if prev.is_empty() || prev.len() != cur.len() {
-        return None;
+fn cpu_percent(prev:(u64,u64),cur:(u64,u64))->f64 {
+    match (cur.0.checked_sub(prev.0),cur.1.checked_sub(prev.1)) {
+        (Some(idle),Some(total)) if prev.1>0 && total>0 => 100.0*(1.0-idle.min(total) as f64/total as f64),
+        _=>0.0
     }
-    let mut deltas: Vec<(f64, f64)> = Vec::new(); // (le, delta count)
-    let mut total_delta = 0.0;
-    for ((ple, pc), (cle, cc)) in prev.iter().zip(cur.iter()) {
-        if ple != cle {
-            return None;
-        }
-        let d = cc - pc;
-        if d < 0.0 {
-            return None; // histogram reset
-        }
-        total_delta += d;
-        deltas.push((*cle, d));
+}
+fn whole_disk(n:&str)->bool {
+    if ["loop","ram","zram"].iter().any(|p| n.starts_with(p)) { return false; }
+    if let Some((_,suffix))=n.rsplit_once('p') {
+        if !suffix.is_empty() && suffix.bytes().all(|b|b.is_ascii_digit()) { return false; }
     }
-    if total_delta <= 0.0 {
-        return None;
+    !(["sd","vd","hd"].iter().any(|p|n.starts_with(p)) && n.ends_with(|c:char|c.is_ascii_digit()))
+}
+fn device_rate(prev:&HashMap<String,(u64,u64)>,cur:&HashMap<String,(u64,u64)>,direction:usize,dt:f64)->f64 {
+    if prev.len()!=cur.len() || cur.is_empty() { return f64::NAN; }
+    let mut sum=0.0;
+    for (name,c) in cur {
+        let Some(p)=prev.get(name) else { return f64::NAN };
+        let (p,c)=if direction==0 {(p.0,c.0)} else {(p.1,c.1)};
+        let Some(delta)=c.checked_sub(p) else {return f64::NAN}; sum+=delta as f64;
     }
-    let pct = |q: f64| -> Option<f64> {
-        let target = total_delta * q;
-        let mut cum = 0.0;
-        for (le, d) in &deltas {
-            cum += d;
-            if cum >= target {
-                return Some(*le);
+    sum/dt
+}
+fn counter_delta(prev:&VllmMetrics,cur:&VllmMetrics,name:&str)->Option<f64> {
+    let prefix=format!("{name}[");
+    let p:HashMap<_,_>=prev.raw.iter().filter(|(k,_)|k.starts_with(&prefix)).collect();
+    let c:HashMap<_,_>=cur.raw.iter().filter(|(k,_)|k.starts_with(&prefix)).collect();
+    if c.is_empty() || p.len()!=c.len() {return None;}
+    let mut delta=0.0;
+    for (key,value) in c {
+        let old=**p.get(key)?;
+        if !value.is_finite() || *value<old {return None;}
+        delta+=*value-old;
+    }
+    Some(delta)
+}
+
+fn histogram_pcts(prev:&[(f64,f64)],cur:&[(f64,f64)])->Option<(Option<f64>,Option<f64>)> {
+    if prev.is_empty() || prev.len()!=cur.len() {return None;}
+    let mut buckets=Vec::new();
+    for (le,count) in cur {
+        let old=prev.iter().find(|(p,_)|p==le)?.1;
+        if *count<old {return None;}
+        buckets.push((*le,count-old));
+    }
+    buckets.sort_by(|a,b|a.0.total_cmp(&b.0));
+    let total=buckets.iter().find(|(le,_)|*le==f64::INFINITY)?.1;
+    if total<=0.0 || buckets.windows(2).any(|w|w[1].1<w[0].1) {return None;}
+    let quantile=|q:f64| {
+        let target=total*q; let(mut last_le,mut last_count)=(0.0,0.0);
+        for (le,count) in &buckets {
+            if *count>=target {
+                if le.is_infinite() {return if last_le>0.0 {Some(last_le)} else {None};}
+                if *count<=last_count {return Some(*le);}
+                return Some(last_le+(le-last_le)*(target-last_count)/(count-last_count));
             }
+            last_le=*le;last_count=*count;
         }
         None
     };
-    Some((pct(0.50), pct(0.95)))
+    Some((quantile(0.5),quantile(0.95)))
 }
-
-pub type Cluster = HashMap<String, NodeHistory>;
+pub type Cluster=HashMap<String,NodeHistory>;

@@ -4,7 +4,8 @@ use crate::config::NodeConfig;
 use crate::parse::parse_collection;
 use crate::sample::Sample;
 use anyhow::Context;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
 
 /// The single compound command run on each node every poll. Cheap; pure text.
 pub const COLLECT_SCRIPT: &str = r#"
@@ -16,7 +17,9 @@ uptime
 echo ===CPU===
 cat /proc/stat
 echo ===CPUFREQ===
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | awk -F/ '{print "cpu"substr($5,4)": "($1/1000)" MHz"}'
+for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq; do
+  [ -r "$f" ] && awk '{print $1/1000}' "$f"
+done
 echo ===MEM===
 grep -E 'MemTotal|MemAvailable|Buffers|^Cached:' /proc/meminfo
 echo ===GPU===
@@ -54,7 +57,8 @@ impl Poller {
     /// Collect one sample. Uses a warm ssh ControlMaster when available,
     /// falling back to a direct ssh invocation. Blocking; run on its own thread.
     pub fn poll(&mut self) -> anyhow::Result<Sample> {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
+        static CLOCK: OnceLock<Instant> = OnceLock::new();
+        let clock = CLOCK.get_or_init(Instant::now);
         let target = format!(
             "{}{}",
             self.node.user.as_deref().map(|u| format!("{u}@")).unwrap_or_default(),
@@ -91,8 +95,11 @@ impl Poller {
         }
         self.consecutive_errs = 0;
         self.last_err = None;
+        let t = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
         self.last_ok_s = Some(t / 1_000_000);
-        parse_collection(&String::from_utf8_lossy(&out.stdout), t)
+        let mut sample = parse_collection(&String::from_utf8_lossy(&out.stdout), t)?;
+        sample.t_mono_us = (clock.elapsed().as_micros() as u64).max(1);
+        Ok(sample)
     }
 
     pub fn status(&self) -> String {

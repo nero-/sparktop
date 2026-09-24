@@ -1,0 +1,24 @@
+use sparktop::{history::NodeHistory, parse::{parse_prometheus,parse_collection}, sample::{Sample,NetDev,DiskDev}};
+fn sample(t:f64, n:f64)->Sample { Sample {t_mono_us:(t*1e6) as u64, vllm:Some(parse_prometheus(&format!("vllm:generation_tokens_total {n}\nvllm:prompt_tokens_total {}",n*2.0))), ..Default::default()} }
+fn close(a:f64,b:f64) {assert!((a-b).abs()<1e-6,"{a} != {b}");}
+#[test] fn rates_use_elapsed_time() { for dt in [0.5,1.0,2.3] {let mut h=NodeHistory::new(); h.push(sample(1.0,0.0));h.push(sample(1.0+dt,dt*100.0));close(h.last().unwrap().1.generation_tps,100.0);close(h.last().unwrap().1.prompt_tps,200.0);} }
+#[test] fn missing_poll_uses_whole_interval() {let mut h=NodeHistory::new();h.push(sample(1.0,0.0));h.push(Sample{t_mono_us:2_000_000,..Default::default()});assert!(h.last().unwrap().1.generation_smooth.is_nan());h.push(sample(3.0,200.0));close(h.last().unwrap().1.generation_tps,100.0);close(h.last().unwrap().1.generation_avg30,100.0);}
+#[test] fn weighted_windows_clip_and_include_idle() {let mut h=NodeHistory::new();h.push(sample(1.0,0.0));h.push(sample(3.0,200.0));h.push(sample(7.0,200.0));let d=h.last().unwrap().1;close(d.generation_smooth,20.0);close(d.generation_avg30,200.0/6.0);}
+#[test] fn reset_starts_new_average() {let mut h=NodeHistory::new();for (t,n) in [(1.,100.),(2.,200.),(3.,0.),(4.,20.)] {h.push(sample(t,n));}assert!(h.derived[2].generation_tps.is_nan());close(h.last().unwrap().1.generation_avg30,20.0);}
+#[test] fn multiple_series_and_label_order() {let mut h=NodeHistory::new();let a="vllm:generation_tokens_total{engine=\"0\",model=\"a b,c\"} 100\nvllm:generation_tokens_total{engine=\"1\"} 50";let b="vllm:generation_tokens_total{model=\"a b,c\",engine=\"0\"} 130\nvllm:generation_tokens_total{engine=\"1\"} 70";for (t,raw) in [(1,a),(2,b)] {h.push(Sample{t_mono_us:t*1_000_000,vllm:Some(parse_prometheus(raw)),..Default::default()});}close(h.last().unwrap().1.generation_tps,50.0);close(h.last().unwrap().0.vllm.as_ref().unwrap().generation_tps,200.0);}
+#[test] fn individual_reset_not_hidden_by_other_engine() {let mut h=NodeHistory::new();for (t,a,b) in [(1,100,100),(2,0,500)] {h.push(Sample{t_mono_us:t*1_000_000,vllm:Some(parse_prometheus(&format!("vllm:generation_tokens_total{{engine=\"0\"}} {a}\nvllm:generation_tokens_total{{engine=\"1\"}} {b}"))),..Default::default()});}assert!(h.last().unwrap().1.generation_tps.is_nan());}
+#[test] fn tx_and_write_only_rates_and_partition_filter() {let mut h=NodeHistory::new();for (t,n) in [(1.0,100),(1.5,150)] {let mut s=sample(t,0.);s.net.insert("eth0".into(),NetDev{rx_bytes:100,tx_bytes:n,..Default::default()});for name in ["sda","sda1","nvme0n1p1"] {s.disks.insert(name.into(),DiskDev{read_bytes:100,write_bytes:n,..Default::default()});}h.push(s);}let d=h.last().unwrap().1;close(d.net_rx_bps,0.);close(d.net_tx_bps,100.);close(d.disk_read_bps,0.);close(d.disk_write_bps,100.);}
+#[test] fn cumulative_histograms_interpolate() {let mut h=NodeHistory::new();for t in [1,2] {let mut raw=String::new();for (le,n) in [("+Inf",100),("0.5",95),("0.1",50)] {raw+=&format!("vllm:time_to_first_token_seconds_bucket{{le=\"{le}\"}} {}\n",if t==1 {0}else{n});}h.push(Sample{t_mono_us:t*1_000_000,vllm:Some(parse_prometheus(&raw)),..Default::default()});}let d=h.last().unwrap().1;close(d.ttft_p50.unwrap(),0.1);close(d.ttft_p95.unwrap(),0.5);}
+#[test] fn histogram_engines_add_and_aliases_do_not() {let v=parse_prometheus("vllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.1\"} 5\nvllm:inter_token_latency_seconds_bucket{engine=\"1\",le=\"0.1\"} 7\nvllm:time_per_output_token_seconds_bucket{le=\"0.1\"} 12\nvllm:num_requests_running{engine=\"0\"} 3\nvllm:num_requests_running{engine=\"1\"} 4\nvllm:kv_cache_usage_perc{engine=\"0\"} 0.2\nvllm:kv_cache_usage_perc{engine=\"1\"} 0.6");assert_eq!(v.tpot_buckets,vec![(0.1,12.0)]);assert_eq!(v.running,7);close(v.gpu_cache_usage,0.6);}
+#[test] fn cpu_indices_guest_and_frequency() {let s=parse_collection("===HOSTNAME===\nfixture\n===CPU===\ncpu 10 0 10 80 0 0 0 0 5 0\ncpu0 10 0 10 80 0 0 0 0 5 0\n===CPUFREQ===\n3000\n2800\n===END===\n",1).unwrap();assert_eq!(s.cpu.all,(80,100));assert_eq!(s.cpu.cores[0],(80,100));assert_eq!(s.cpu.mhz,vec![3000.,2800.]);}
+
+#[test] fn display_has_smoothing_rolling_and_raw() {
+ use sparktop::{history::Cluster,ui::{self,Page}};
+ use ratatui::{Terminal,backend::TestBackend};
+ let mut h=NodeHistory::new();h.push(sample(1.,0.));h.push(sample(1.5,50.));
+ let mut c=Cluster::new();c.insert("test".into(),h);
+ let mut term=Terminal::new(TestBackend::new(140,45)).unwrap();
+ term.draw(|f|ui::draw(f,&c,&["test".into()],Page::Vllm,0,false,0.5,&None,&[None],60.,&[],&[],false,&None)).unwrap();
+ let text:String=term.backend().buffer().content.iter().map(|c|c.symbol()).collect();
+ assert!(text.contains("5s / 30s"));assert!(text.contains("30s avg 100"));assert!(text.contains("raw PP 200 · TG 100"));assert!(!text.contains("NaN"));
+}

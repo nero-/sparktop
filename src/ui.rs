@@ -127,6 +127,7 @@ fn chart_color(kind: ChartKind, t: &Theme) -> ratatui::style::Color {
 
 // ── formatting (vllm-top conventions) ────────────────────────────────
 fn fmt_tokens(v: f64) -> String {
+    if !v.is_finite() { return "—".into(); }
     if v >= 1.0e6 {
         format!("{:.1}M", v / 1.0e6)
     } else if v >= 1.0e3 {
@@ -137,6 +138,7 @@ fn fmt_tokens(v: f64) -> String {
 }
 
 fn fmt_bps(bps: f64) -> String {
+    if !bps.is_finite() { return "—".into(); }
     if bps.abs() >= 1e6 {
         format!("{:.1}MB/s", bps / 1e6)
     } else if bps.abs() >= 1e3 {
@@ -266,9 +268,7 @@ fn dt_of(h: &NodeHistory) -> Vec<f64> {
         h.samples
             .windows(2)
             .map(|w| {
-                ((w[1].t_unix_us.max(w[0].t_unix_us) - w[0].t_unix_us.min(w[1].t_unix_us)) as f64
-                    / 1e6)
-                    .clamp(0.1, 60.0)
+                w[1].rate_time_us().saturating_sub(w[0].rate_time_us()) as f64 / 1e6
             })
             .collect()
     } else {
@@ -315,8 +315,9 @@ fn draw_graph(
     // 45% of the panel — auto-scaling would make idle look pegged
     let scale = if unit.contains('%') { 100.0 } else { vmax.max(peak) };
     let (ref_lines, _ymax) = grid_for_scale(scale);
-    let now = vals.iter().rev().find_map(|v| *v).unwrap_or(0.0);
+    let now = vals.last().copied().flatten().unwrap_or(f64::NAN);
     let fmtv = |v: f64| -> String {
+        if !v.is_finite() { return "—".into(); }
         if unit.contains("tok/s") {
             format!("{} tok/s", fmt_tokens(v))
         } else if unit.contains("B/s") {
@@ -333,7 +334,7 @@ fn draw_graph(
         Span::styled(format!(" {title} "), Style::new().fg(t.fg).add_modifier(Modifier::BOLD)),
         Span::styled(format!("({gloss}) "), Style::new().fg(t.dim)),
         Span::styled(
-            format!("— {} {} · peak {} ", "now", fmtv(now), fmtv(scale.max(peak))),
+            format!("— {} {} · peak {} ", "now", fmtv(now), fmtv(peak)),
             Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
         ),
         Span::styled("● ", Style::new().fg(color).add_modifier(Modifier::BOLD)),
@@ -903,17 +904,11 @@ fn draw_vllm(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         hero_cell("RUNNING", &fmt_tokens(v.running as f64), "being answered now", bold(t.fg)),
         hero_cell("QUEUE", &fmt_tokens(v.waiting as f64), "waiting to start", bold(if v.waiting > 20 { t.bad } else if v.waiting > 5 { t.warn } else { t.fg })),
         (
-            "TOKEN/s".into(),
+            "TOK/S · 5s / 30s".into(),
             vec![
-                Line::from(vec![
-                    Span::styled(" prefill ", Style::new().fg(t.dim)),
-                    Span::styled(format!("{:.0} tok/s", d.prompt_tps), bold(t.s2)),
-                ]),
-                Line::from(vec![
-                    Span::styled(" decode  ", Style::new().fg(t.dim)),
-                    Span::styled(format!("{:.0} tok/s", d.generation_tps), bold(t.s1)),
-                ]),
-                Line::from(Span::styled(" prompt+computed context", Style::new().fg(t.dim))),
+                Line::from(Span::styled(format!(" prefill {} / {}", fmt_tokens(d.prompt_smooth), fmt_tokens(d.prompt_avg30)), bold(t.s2))),
+                Line::from(Span::styled(format!(" decode  {} / {}", fmt_tokens(d.generation_smooth), fmt_tokens(d.generation_avg30)), bold(t.s1))),
+                Line::from(Span::styled(format!(" raw PP {} · TG {}", fmt_tokens(d.prompt_tps), fmt_tokens(d.generation_tps)), Style::new().fg(t.dim))),
             ],
         ),
         hero_cell("TTFT", &fmt_secs(d.ttft_p95), "p95 · first token", bold(if d.ttft_p95.unwrap_or(0.0) > 1.0 { t.bad } else { t.good })),
@@ -921,23 +916,23 @@ fn draw_vllm(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
         (
             "MEMORY POOLS".into(),
             vec![
-                Line::from(Span::styled(format!(" gpu KV {:.0}%", v.gpu_cache_usage * 100.0), bold(usage_color(t, v.gpu_cache_usage)))),
+                Line::from(Span::styled(format!(" max gpu KV {:.0}%", v.gpu_cache_usage * 100.0), bold(usage_color(t, v.gpu_cache_usage)))),
                 Line::from(Span::styled(format!(" cpu KV {:.0}%", v.cpu_cache_usage * 100.0), bold(t.accent))),
                 Line::from(Span::styled(" full = requests queue", Style::new().fg(t.dim))),
             ],
         ),
     ];
-    let col_ws = [12u16, 12, 22, 14, 14, 18];
+    let col_ws = [12u16, 12, 28, 14, 14, 18];
     render_hero(f, t, rows[0], &cells, &col_ws);
 
     // prefill / decode graphs (the centerpiece)
     let chart_cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
-    let (pv, pdt) = gaps(h, |d| d.prompt_tps);
-    let (dv, ddt) = gaps(h, |d| d.generation_tps);
+    let (pv, pdt) = gaps(h, |d| d.prompt_smooth);
+    let (dv, ddt) = gaps(h, |d| d.generation_smooth);
     let p_peak = pv.iter().filter_map(|v| *v).fold(0.0, f64::max);
     let d_peak = dv.iter().filter_map(|v| *v).fold(0.0, f64::max);
-    draw_graph(f, t, chart_cols[0], "Prefill", "prompt processing", &pv, &pdt, window_secs, t.s2, " tok/s", p_peak, None);
-    draw_graph(f, t, chart_cols[1], "Decode", "token generation", &dv, &ddt, window_secs, t.s1, " tok/s", d_peak, None);
+    draw_graph(f, t, chart_cols[0], "Prefill", "5s mean", &pv, &pdt, window_secs, t.s2, " tok/s", p_peak, Some(Line::from(format!(" raw {} · 30s avg {} tok/s ", fmt_tokens(d.prompt_tps), fmt_tokens(d.prompt_avg30)))));
+    draw_graph(f, t, chart_cols[1], "Decode", "5s mean · aggregate", &dv, &ddt, window_secs, t.s1, " tok/s", d_peak, Some(Line::from(format!(" raw {} · 30s avg {} tok/s ", fmt_tokens(d.generation_tps), fmt_tokens(d.generation_avg30)))));
 
     // latency table + ttft/tpot plots
     let lat_cols = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(33), Constraint::Percentage(33)]).split(rows[2]);
@@ -977,21 +972,21 @@ fn draw_vllm(f: &mut Frame, area: Rect, cluster: &Cluster, name: Option<&String>
     let cache_inner = cache_block.inner(bot_cols[0]);
     f.render_widget(cache_block, bot_cols[0]);
     let cache_kvs = vec![
-        Kv::colored("gpu KV", format!("{:.0}%", v.gpu_cache_usage * 100.0), "on-device prefix cache", usage_color(t, v.gpu_cache_usage)),
+        Kv::colored("max gpu KV", format!("{:.0}%", v.gpu_cache_usage * 100.0), "busiest engine", usage_color(t, v.gpu_cache_usage)),
         Kv::colored("cpu KV", format!("{:.0}%", v.cpu_cache_usage * 100.0), "host offload tier", t.accent),
     ];
     f.render_widget(Paragraph::new(kv_lines(t, cache_kvs, cache_inner.width as usize)), cache_inner);
 
     let peaks_block = block_titled(
         Line::from(Span::styled(" peaks ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD))),
-        Some(Line::from(Span::styled(" since sparktop started ", Style::new().fg(t.dim)))),
+        Some(Line::from(Span::styled(" raw · retained history ", Style::new().fg(t.dim)))),
         t,
     );
     let peaks_inner = peaks_block.inner(bot_cols[1]);
     f.render_widget(peaks_block, bot_cols[1]);
     let peaks_kvs = vec![
-        Kv::colored("decode", format!("{:>7.0} tok/s", d_peak), &format!("now {:.0}", d.generation_tps), t.s1),
-        Kv::colored("prefill", format!("{:>7.0} tok/s", p_peak), &format!("now {:.0}", d.prompt_tps), t.s2),
+        Kv::colored("decode", format!("{} tok/s", fmt_tokens(h.derived.iter().map(|d| d.generation_tps).filter(|v| v.is_finite()).fold(0.0, f64::max))), &format!("raw {}", fmt_tokens(d.generation_tps)), t.s1),
+        Kv::colored("prefill", format!("{} tok/s", fmt_tokens(h.derived.iter().map(|d| d.prompt_tps).filter(|v| v.is_finite()).fold(0.0, f64::max))), &format!("raw {}", fmt_tokens(d.prompt_tps)), t.s2),
     ];
     f.render_widget(Paragraph::new(kv_lines(t, peaks_kvs, peaks_inner.width as usize)), peaks_inner);
 }

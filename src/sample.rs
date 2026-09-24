@@ -1,5 +1,4 @@
-/// One polled sample from a node. Timestamps are unix microseconds
-/// (monotonic-suff for delta math via our own bookkeeping).
+/// One polled sample; wall time for display and monotonic receipt time for rates.
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +79,8 @@ pub struct DiskDev {
 pub struct Sample {
     #[allow(dead_code)]
     pub t_unix_us: u64,
+    /// Monotonic receipt timestamp used for rates; zero in legacy fixtures.
+    pub t_mono_us: u64,
     pub hostname: String,
     pub gpus: Vec<Gpu>,
     pub mem: Mem,
@@ -90,17 +91,23 @@ pub struct Sample {
     pub vllm: Option<VllmMetrics>,
 }
 
+impl Sample {
+    pub fn rate_time_us(&self) -> u64 {
+        if self.t_mono_us > 0 { self.t_mono_us } else { self.t_unix_us }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VllmMetrics {
-    /// prompt tokens/s (prefill)
+    /// Cumulative prompt token counter; rates live in Derived.
     pub prompt_tps: f64,
-    /// generation tokens/s (decode)
+    /// Cumulative generation token counter; rates live in Derived.
     pub generation_tps: f64,
     pub running: u64,
     pub waiting: u64,
     pub gpu_cache_usage: f64,
     pub cpu_cache_usage: f64,
-    /// histogram bucket sums for TTFT: (cum_count, cumulative sums per bucket)
+    /// TTFT buckets: (upper bound, cumulative count).
     pub ttft_buckets: Vec<(f64, f64)>,
     /// histogram bucket sums for ITL/TPOT
     pub tpot_buckets: Vec<(f64, f64)>,

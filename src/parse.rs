@@ -43,7 +43,6 @@ pub fn parse_collection(raw: &str, t_unix_us: u64) -> anyhow::Result<Sample> {
                 "CPUFREQ" => {
                     s.cpu.mhz = buf
                         .lines()
-                        .filter_map(|l| l.split(':').nth(1))
                         .filter_map(|v| v.trim().parse::<f64>().ok())
                         .collect();
                 }
@@ -96,14 +95,16 @@ fn parse_proc_stat(text: &str) -> anyhow::Result<Cpu> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("cpu") {
-            let fields: Vec<u64> =
-                rest.split_whitespace().filter_map(|f| f.parse().ok()).collect();
+            let ticks = if rest.starts_with(' ') { rest } else {
+                rest.split_once(char::is_whitespace).map(|(_,v)|v).unwrap_or("")
+            };
+            let fields: Vec<u64> = ticks.split_whitespace().filter_map(|f| f.parse().ok()).collect();
             if fields.len() < 5 {
                 continue;
             }
             // user nice system idle iowait irq softirq steal ...
             let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
-            let total: u64 = fields.iter().sum();
+            let total: u64 = fields.iter().take(8).sum();
             if rest.starts_with(' ') {
                 cpu.all = (idle, total);
             } else {
@@ -119,8 +120,6 @@ fn parse_proc_stat(text: &str) -> anyhow::Result<Cpu> {
             }
         }
     }
-    // drop placeholder slots for never-seen cores
-    cpu.cores.retain(|(_, total)| *total > 0);
     Ok(cpu)
 }
 
@@ -168,8 +167,8 @@ pub fn parse_nvidia_smi(text: &str) -> anyhow::Result<Vec<Gpu>> {
             index: f[0].parse().unwrap_or(0),
             name: f[1].to_string(),
             util_pct: num(2),
-            mem_used_mb: num(mem_used),
-            mem_total_mb: num(mem_total),
+            mem_used_mb: if f.len() >= 12 { num(mem_used) } else { 0.0 },
+            mem_total_mb: if f.len() >= 12 { num(mem_total) } else { 0.0 },
             power_w: num(power_i),
             power_limit_w: limit_i.map(num).unwrap_or(0.0),
             temp_c: num(temp_i),
@@ -245,70 +244,68 @@ pub fn parse_diskstats(text: &str) -> anyhow::Result<HashMap<String, DiskDev>> {
     Ok(map)
 }
 
-/// Parse a Prometheus text exposition payload, extracting vLLM metrics.
-pub fn parse_prometheus(text: &str) -> VllmMetrics {
-    let mut m = VllmMetrics::default();
-    let mut raw = HashMap::new();
-    for line in text.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
-            continue;
-        }
-        let (metric, val) = match line.split_once(' ') {
-            Some(x) => x,
-            None => continue,
-        };
-        let v: f64 = val.trim().parse().unwrap_or(0.0);
-        // metric{labels}
-        let (name, labels) = match metric.split_once('{') {
-            Some((n, l)) => (n, l.trim_end_matches('}')),
-            None => (metric, ""),
-        };
-        let label = |want: &str| -> Option<String> {
-            for pair in labels.split(',').filter(|p| !p.is_empty()) {
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k.trim() == want {
-                        return Some(v.trim_matches('"').to_string());
-                    }
-                }
-            }
-            None
-        };
-        raw.insert(format!("{name}[{labels}]"), v);
-        match name {
-            "vllm:prompt_tokens_total" => m.prompt_tps = v, // raw counter; rate computed later
-            "vllm:generation_tokens_total" => m.generation_tps = v,
-            "vllm:num_requests_running" => m.running = v as u64,
-            "vllm:num_requests_waiting" => m.waiting = v as u64,
-            // cache usage: newer vLLM exposes a single kv_cache_usage_perc
-            // (no CPU offload tier); older splits gpu_/cpu_
-            "vllm:kv_cache_usage_perc" | "vllm:gpu_cache_usage_perc" => m.gpu_cache_usage = v,
-            "vllm:cpu_cache_usage_perc" => m.cpu_cache_usage = v,
-            "vllm:time_to_first_token_seconds_bucket" => {
-                if let Some(le) = label("le") {
-                    let le: f64 = if le == "+Inf" { f64::INFINITY } else { le.parse().unwrap_or(0.0) };
-                    bucket_push(&mut m.ttft_buckets, le, v);
-                }
-            }
-            // TPOT histogram: "time_per_output_token_seconds" on older
-            // vLLM, "inter_token_latency_seconds" on newer
-            "vllm:time_per_output_token_seconds_bucket"
-            | "vllm:inter_token_latency_seconds_bucket" => {
-                if let Some(le) = label("le") {
-                    let le: f64 = if le == "+Inf" { f64::INFINITY } else { le.parse().unwrap_or(0.0) };
-                    bucket_push(&mut m.tpot_buckets, le, v);
-                }
-            }
-            _ => {}
-        }
+/// Split labels outside quoted/escaped values and canonicalize series identity.
+fn label_pairs(labels: &str) -> Vec<&str> {
+    let (mut quoted,mut escape,mut start)=(false,false,0);
+    let mut parts=Vec::new();
+    for (i,c) in labels.char_indices() {
+        if escape {escape=false;continue;}
+        if c=='\\' && quoted {escape=true;continue;}
+        if c=='"' {quoted=!quoted;}
+        if c==',' && !quoted {parts.push(labels[start..i].trim());start=i+1;}
     }
-    m.raw = raw;
-    m
+    if start<labels.len() {parts.push(labels[start..].trim());}
+    parts.sort_unstable();parts
 }
 
-fn bucket_push(buckets: &mut Vec<(f64, f64)>, le: f64, v: f64) {
-    if let Some(slot) = buckets.iter_mut().find(|(l, _)| *l == le) {
-        slot.1 = v;
-    } else {
-        buckets.push((le, v));
+/// Parse counters by series; scalar fields summarize independent series.
+pub fn parse_prometheus(text: &str) -> VllmMetrics {
+    let mut m=VllmMetrics::default();
+    let mut legacy_tpot=Vec::new();
+    let mut modern_tpot=false;
+    let mut legacy_cache:f64=0.0;
+    let mut modern_cache=false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') || line.is_empty() {continue;}
+        let (mut quoted,mut escape,mut braces)=(false,false,0i32);
+        let split=line.char_indices().find_map(|(i,c)| {
+            if escape {escape=false;return None;}
+            if c=='\\' && quoted {escape=true;return None;}
+            if c=='"' {quoted=!quoted;}
+            if !quoted {if c=='{' {braces+=1;} if c=='}' {braces-=1;}}
+            if c.is_whitespace() && !quoted && braces==0 {Some(i)} else {None}
+        });
+        let Some(i)=split else {continue};
+        let metric=&line[..i];
+        let Some(v)=line[i..].split_whitespace().next().and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()) else {continue};
+        let (name,labels)=metric.split_once('{').map(|(n,l)|(n,l.trim_end_matches('}'))).unwrap_or((metric,""));
+        let pairs=label_pairs(labels);
+        let le=|| pairs.iter().find_map(|p|p.split_once('=').filter(|(k,_)|k.trim()=="le").map(|(_,v)|v.trim_matches('"')))
+            .and_then(|v|if v=="+Inf" {Some(f64::INFINITY)} else {v.parse().ok()});
+        let key=format!("{name}[{}]",pairs.join(","));
+        if m.raw.contains_key(&key) {continue;}
+        m.raw.insert(key,v);
+        match name {
+            "vllm:prompt_tokens_total"=>m.prompt_tps+=v,
+            "vllm:generation_tokens_total"=>m.generation_tps+=v,
+            "vllm:num_requests_running"=>m.running+=v.max(0.0) as u64,
+            "vllm:num_requests_waiting"=>m.waiting+=v.max(0.0) as u64,
+            "vllm:kv_cache_usage_perc"=>{m.gpu_cache_usage=m.gpu_cache_usage.max(v);modern_cache=true;},
+            "vllm:gpu_cache_usage_perc"=>legacy_cache=legacy_cache.max(v),
+            "vllm:cpu_cache_usage_perc"=>m.cpu_cache_usage=m.cpu_cache_usage.max(v),
+            "vllm:time_to_first_token_seconds_bucket"=>if let Some(le)=le(){bucket_push(&mut m.ttft_buckets,le,v);},
+            "vllm:inter_token_latency_seconds_bucket"=>{modern_tpot=true;if let Some(le)=le(){bucket_push(&mut m.tpot_buckets,le,v);}},
+            "vllm:time_per_output_token_seconds_bucket"=>if let Some(le)=le(){bucket_push(&mut legacy_tpot,le,v);},
+            _=>{}
+        }
     }
+    if !modern_tpot {m.tpot_buckets=legacy_tpot;}
+    if !modern_cache {m.gpu_cache_usage=legacy_cache;}
+    m.ttft_buckets.sort_by(|a,b|a.0.total_cmp(&b.0));
+    m.tpot_buckets.sort_by(|a,b|a.0.total_cmp(&b.0));
+    m
+}
+fn bucket_push(buckets:&mut Vec<(f64,f64)>,le:f64,v:f64) {
+    if let Some(slot)=buckets.iter_mut().find(|(l,_)|*l==le) {slot.1+=v;}
+    else {buckets.push((le,v));}
 }

@@ -1,6 +1,6 @@
 # sparktop node configuration
 # Add a node by appending a [[nodes]] block — the poller picks it up on restart.
-interval = 1.0
+interval = 0.5
 
 [[nodes]]
 name = "spark-r0"
@@ -11,7 +11,13 @@ user = "nero"
 vllm_url = "http://localhost:8000"
 
 # Tomorrow's second node — uncomment when it's up:
-# [[nodes]]
-# name = "spark-r1"
-# host = "192.168.50.220"   # adjust to actual address
-# user = "nero"
+[[nodes]]
+name = "spark-r1"
+host = "192.168.50.129"   # adjust to actual address
+user = "nero"
+
+[[nodes]]
+name = "gx10-r0"
+host = "gx10-r0"
+user = "nero"
+vllm_url = "http://localhost:8015"

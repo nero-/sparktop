@@ -42,3 +42,22 @@ Graph renderer, theme system, and panel conventions adapted from
 [vllm-top](https://github.com/mratsim/vllm-top) (GPLv3, © mratsim); layout
 inspiration from [btop](https://github.com/aristocratos/btop).
 This project is GPLv3 as a result.
+
+## Rate display
+
+The vLLM page shows a time-weighted **5-second mean** for smooth live graphs,
+a **30-second rolling average**, and the unsmoothed **raw** rate from the latest
+counter interval. Rates divide token/byte counter changes by actual monotonic
+elapsed time, including delayed SSH polls. Idle intervals count toward averages;
+startup uses the available history. Missing metrics show unavailable, and counter
+resets or engine-series changes begin a new averaging segment.
+
+Decode is aggregate output across requests at the selected API endpoint. Engine
+series are summed; tensor-parallel GPU ranks must not be counted again. This is
+not the same window as a benchmark's per-request generation average. Prompt
+counter throughput includes idle time and is not a direct cold-prefill benchmark.
+Peaks refer to raw samples retained in history, not process lifetime. Latency
+percentiles are interpolated from cumulative histogram changes between scrapes;
+KV occupancy is the busiest engine's value.
+
+Run regression checks with `cargo test --offline`.
