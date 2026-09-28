@@ -1,7 +1,15 @@
 [package]
 name = "sparktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Terminal resource monitor for NVIDIA DGX Spark clusters: GPU, unified memory, network and vLLM metrics over agentless SSH"
+license = "GPL-3.0-only"
+repository = "https://github.com/nero-/sparktop"
+readme = "README.md"
+keywords = ["monitoring", "tui", "gpu", "vllm", "dgx-spark"]
+categories = ["command-line-utilities", "visualization"]
+exclude = ["docs/", "scripts/"]
 
 [dependencies]
 ratatui = "0.29"
