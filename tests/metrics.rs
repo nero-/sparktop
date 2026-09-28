@@ -13,12 +13,14 @@ fn close(a:f64,b:f64) {assert!((a-b).abs()<1e-6,"{a} != {b}");}
 #[test] fn cpu_indices_guest_and_frequency() {let s=parse_collection("===HOSTNAME===\nfixture\n===CPU===\ncpu 10 0 10 80 0 0 0 0 5 0\ncpu0 10 0 10 80 0 0 0 0 5 0\n===CPUFREQ===\n3000\n2800\n===END===\n",1).unwrap();assert_eq!(s.cpu.all,(80,100));assert_eq!(s.cpu.cores[0],(80,100));assert_eq!(s.cpu.mhz,vec![3000.,2800.]);}
 
 #[test] fn display_has_smoothing_rolling_and_raw() {
- use sparktop::{history::Cluster,ui::{self,Page}};
+ use sparktop::{history::Cluster,ui::{self,Page},app::{UiState,NodeInfo},config::Alerts};
  use ratatui::{Terminal,backend::TestBackend};
  let mut h=NodeHistory::new();h.push(sample(1.,0.));h.push(sample(1.5,50.));
  let mut c=Cluster::new();c.insert("test".into(),h);
+ let nodes=[NodeInfo{name:"test".into(),host:"h".into(),group:"default".into(),has_vllm:true}];
+ let mut st=UiState::new(0.5,Alerts::default());st.page=Page::Vllm;
  let mut term=Terminal::new(TestBackend::new(140,45)).unwrap();
- term.draw(|f|ui::draw(f,&c,&["test".into()],Page::Vllm,0,false,0.5,&None,&[None],60.,&[],&[],false,&None)).unwrap();
+ term.draw(|f|ui::draw(f,&c,&nodes,&mut st)).unwrap();
  let text:String=term.backend().buffer().content.iter().map(|c|c.symbol()).collect();
  assert!(text.contains("5s / 30s"));assert!(text.contains("30s avg 100"));assert!(text.contains("raw PP 200 · TG 100"));assert!(!text.contains("NaN"));
 }

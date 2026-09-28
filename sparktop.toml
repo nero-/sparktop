@@ -1,23 +1,35 @@
 # sparktop node configuration
-# Add a node by appending a [[nodes]] block — the poller picks it up on restart.
+# Add a node by appending a [[nodes]] block — sparktop picks up edits live.
+# `cluster` groups nodes; press g to filter the view to one group.
 interval = 0.5
 
 [[nodes]]
 name = "spark-r0"
+cluster = "spark"
 host = "192.168.50.219"
 user = "nero"
 # vLLM metrics: scraped from the node itself (must be reachable from the node,
 # so localhost works even if the port isn't exposed externally)
-vllm_url = "http://localhost:8000"
+vllm_url = "http://192.168.50.219:8015"
 
 # Tomorrow's second node — uncomment when it's up:
 [[nodes]]
 name = "spark-r1"
+cluster = "spark"
 host = "192.168.50.129"   # adjust to actual address
 user = "nero"
 
 [[nodes]]
 name = "gx10-r0"
+cluster = "gx10"
 host = "gx10-r0"
 user = "nero"
-vllm_url = "http://localhost:8015"
+vllm_url = "http://localhost:8000"
+
+[[nodes]]
+name = "gx10-r3"
+cluster = "gx10"
+host = "192.168.50.5"
+user = "nero"
+vllm_url = "http://localhost:8000"
+

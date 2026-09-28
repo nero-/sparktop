@@ -113,4 +113,25 @@ pub struct VllmMetrics {
     pub tpot_buckets: Vec<(f64, f64)>,
     /// raw counters we diff for derived rates
     pub raw: HashMap<String, f64>,
+    /// served model name (first `model_name` label seen)
+    pub model: Option<String>,
+    /// cumulative prefix-cache hits / queries (tokens), summed over engines
+    pub prefix_hits: f64,
+    pub prefix_queries: f64,
+    /// legacy v0 gauge (0–1) when the counters are absent
+    pub prefix_hit_rate_gauge: Option<f64>,
+    /// cumulative finished requests, summed over finish reasons/engines
+    pub requests_done: f64,
+    /// cumulative preemptions (KV pressure evictions)
+    pub preemptions: f64,
+}
+
+impl VllmMetrics {
+    /// Drop the bulky per-series maps once a sample is no longer the newest;
+    /// scalar totals stay so windowed ratios can still be computed.
+    pub fn slim(&mut self) {
+        self.raw = HashMap::new();
+        self.ttft_buckets = Vec::new();
+        self.tpot_buckets = Vec::new();
+    }
 }

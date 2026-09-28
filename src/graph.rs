@@ -21,11 +21,18 @@ use std::sync::Mutex;
 pub static THEME_LOCK: Mutex<()> = Mutex::new(());
 
 /// Calibration gridlines for an observed peak, at any magnitude: one line
-/// per round step, the last step above the peak, scale topped 10% higher.
+/// per round step (widened to keep ≤5 lines), the last step above the
+/// peak, scale topped 10% higher.
 /// The lowest line carries the axis unit.
 pub fn grid_for_scale(scale: f64) -> (Vec<f64>, f64) {
     if scale > 0.0 {
-        let step = 10.0_f64.powf(scale.log10().floor());
+        let mut step = 10.0_f64.powf(scale.log10().floor());
+        // at most five lines: 84°C gets 20/40/60/80, not nine rulings
+        for widen in [2.0, 2.5] {
+            if (scale / step).ceil() > 5.0 {
+                step *= widen;
+            }
+        }
         let top_line = (scale / step).ceil() * step;
         let lines: Vec<f64> = (1..=(top_line / step) as i64)
             .map(|m| m as f64 * step)
@@ -43,6 +50,149 @@ pub struct PlotDress<'a> {
     pub overlay: Option<(&'a [Option<f64>], Color)>,
     /// dim color for gridline labels (faded, must not compete with data)
     pub dim: Color,
+    /// btop-style vertical gradient: the fill blends from the series color
+    /// at the baseline to this color at the top of the scale
+    pub hot: Option<Color>,
+}
+
+/// Right-aligned x position (in dots) of every sample: the newest sample
+/// sits on the right edge and older ones step left by their real interval.
+fn x_positions(n: usize, dt: &[f64], window_secs: f64, w_dots: f64) -> Vec<f64> {
+    let span: f64 = dt.iter().take(n.saturating_sub(1)).sum();
+    let mut out = Vec::with_capacity(n);
+    let mut x = 0.0;
+    for i in 0..n {
+        out.push((w_dots - 1.0) - (span - x) / window_secs * (w_dots - 1.0));
+        x += dt.get(i).copied().unwrap_or(1.0);
+    }
+    out
+}
+
+/// Bucket a series into `width` columns covering the last `window_secs`
+/// (mean per column, newest on the right). Columns with no samples are None.
+pub fn resample(vals: &[Option<f64>], dt: &[f64], window_secs: f64, width: usize) -> Vec<Option<f64>> {
+    if width == 0 || vals.is_empty() || window_secs <= 0.0 {
+        return vec![None; width];
+    }
+    let xs = x_positions(vals.len(), dt, window_secs, width as f64 + 1.0);
+    let mut sum = vec![0.0; width];
+    let mut cnt = vec![0u32; width];
+    for (v, x) in vals.iter().zip(xs) {
+        if let Some(v) = v {
+            if x >= 0.0 {
+                let c = (x as usize).min(width - 1);
+                sum[c] += v;
+                cnt[c] += 1;
+            }
+        }
+    }
+    // carry the last value across empty columns between samples so slow
+    // polls on wide sparklines read as a continuous line, not dashes
+    let mut out: Vec<Option<f64>> = sum.iter().zip(&cnt).map(|(s, c)| (*c > 0).then(|| s / *c as f64)).collect();
+    let first = out.iter().position(|v| v.is_some());
+    if let Some(first) = first {
+        let mut last = out[first];
+        for v in out.iter_mut().skip(first) {
+            if v.is_some() { last = *v; } else { *v = last; }
+        }
+    }
+    out
+}
+
+fn trim_float(v: f64) -> String {
+    if (v - v.round()).abs() < 0.05 { format!("{v:.0}") } else { format!("{v:.1}") }
+}
+
+/// One series in a comparison graph.
+pub struct Series<'a> {
+    pub vals: &'a [Option<f64>],
+    pub dt: &'a [f64],
+    pub color: Color,
+}
+
+/// Overlay several series as lines on a shared scale (compare view).
+pub fn multi_line_graph(
+    f: &mut Frame,
+    area: Rect,
+    series: &[Series<'_>],
+    window_secs: f64,
+    ref_lines: &[f64],
+    unit: &str,
+    dim: Color,
+) {
+    if window_secs <= 0.0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w_dots = area.width as f64 * 2.0;
+    let h_dots = area.height as f64 * 4.0;
+    let ymax = ymax_of(ref_lines, window_secs);
+    let y_of = |v: f64| (v / ymax * h_dots * 0.96).clamp(0.0, h_dots * 0.96);
+    let mut segs: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
+    for s in series {
+        let xs = x_positions(s.vals.len(), s.dt, window_secs, w_dots);
+        let mut prev: Option<(f64, f64)> = None;
+        for (v, x) in s.vals.iter().zip(&xs) {
+            match v {
+                Some(v) => {
+                    let p = (*x, y_of(*v));
+                    if let Some(q) = prev {
+                        if p.0 >= 0.0 {
+                            segs.push((q.0.max(0.0), q.1, p.0, p.1, s.color));
+                        }
+                    }
+                    prev = Some(p);
+                }
+                None => prev = None,
+            }
+        }
+    }
+    let grid: Vec<f64> = ref_lines.iter().map(|v| y_of(*v).clamp(1.0, h_dots - 2.0)).collect();
+    let labels: Vec<(f64, String)> = ref_lines
+        .iter()
+        .zip(&grid)
+        .enumerate()
+        .filter(|(i, _)| *i == 0 || *i + 1 == ref_lines.len())
+        .map(|(i, (v, y))| (y + 2.0, if i == 0 { format!("{}{unit}", short_num(*v)) } else { short_num(*v) }))
+        .collect();
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, w_dots])
+        .y_bounds([0.0, h_dots])
+        .paint(move |ctx| {
+            for ry in &grid {
+                let mut x = 0.0;
+                while x < w_dots {
+                    ctx.draw(&CLine { x1: x, y1: *ry, x2: (x + 1.0).min(w_dots - 1.0), y2: *ry, color: dim });
+                    x += 6.0;
+                }
+            }
+            ctx.layer();
+            for (x1, y1, x2, y2, color) in &segs {
+                ctx.draw(&CLine { x1: *x1, y1: *y1, x2: *x2, y2: *y2, color: *color });
+            }
+            if area.width >= 16 {
+                for (y, text) in &labels {
+                    ctx.print(1.0, *y, Span::styled(text.clone(), Style::new().fg(dim)));
+                }
+            }
+        });
+    f.render_widget(canvas, area);
+}
+
+fn short_num(v: f64) -> String {
+    if v >= 1.0e9 {
+        format!("{}G", trim_float(v / 1.0e9))
+    } else if v >= 1.0e6 {
+        format!("{:.0}M", v / 1.0e6)
+    } else if v >= 1.0e3 {
+        format!("{:.0}k", v / 1.0e3)
+    } else if v < 0.1 {
+        format!("{v:.2}")
+    } else if v < 1.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.0}")
+    }
 }
 
 /// Draw the fill graph into `area` (already inside the panel borders).
@@ -61,6 +211,7 @@ pub fn mini_line_graph(
     let ref_lines = dress.ref_lines;
     let overlay = dress.overlay;
     let dim = dress.dim;
+    let hot = dress.hot;
     if window_secs <= 0.0 || area.width == 0 || area.height == 0 {
         return;
     }
@@ -152,17 +303,7 @@ pub fn mini_line_graph(
             continue;
         }
         used_slot = Some(slot);
-        let n = if *v >= 1.0e6 {
-            format!("{:.0}M", v / 1.0e6)
-        } else if *v >= 1.0e3 {
-            format!("{:.0}k", v / 1.0e3)
-        } else if *v < 0.1 {
-            format!("{v:.2}")
-        } else if *v < 1.0 {
-            format!("{v:.1}")
-        } else {
-            format!("{v:.0}")
-        };
+        let n = short_num(*v);
         let text = if Some(*v) == lowest {
             format!("{n}{unit}")
         } else {
@@ -170,6 +311,12 @@ pub fn mini_line_graph(
         };
         labels.push((y, text));
     }
+    // rulings are faint: a tint of the series, never competing with data
+    let grid_color = crate::theme::lerp(dim, color, 0.35);
+    let gradient: Option<Vec<Color>> = hot.map(|hot| {
+        let rows = canvas_rows.max(1);
+        (0..rows).map(|k| crate::theme::lerp(color, hot, k as f64 / rows.saturating_sub(1).max(1) as f64)).collect()
+    });
     let canvas = Canvas::default()
         .marker(Marker::Braille)
         .x_bounds([0.0, w_dots])
@@ -181,11 +328,11 @@ pub fn mini_line_graph(
                     ctx.draw(&CLine {
                         x1: x,
                         y1: *ry,
-                        x2: (x + 2.0).min(w_dots - 1.0),
+                        x2: (x + 1.0).min(w_dots - 1.0),
                         y2: *ry,
-                        color,
+                        color: grid_color,
                     });
-                    x += 5.0;
+                    x += 6.0;
                 }
             }
             // labels overlap the fill on narrow panels — skip below 16 cols
@@ -194,9 +341,30 @@ pub fn mini_line_graph(
                     ctx.print(2.0, *y, Span::styled(text.clone(), Style::new().fg(dim)));
                 }
             }
-            for (cx, h) in &cols {
-                ctx.draw(&CLine { x1: *cx, y1: 0.0, x2: *cx, y2: *h, color });
+            match &gradient {
+                None => {
+                    for (cx, h) in &cols {
+                        ctx.draw(&CLine { x1: *cx, y1: 0.0, x2: *cx, y2: *h, color });
+                    }
+                }
+                // one color per braille cell row (the terminal's color
+                // resolution), so segments break on 4-dot boundaries
+                Some(g) => {
+                    for (cx, h) in &cols {
+                        let mut y0 = 0.0;
+                        let mut k = 0;
+                        while y0 < *h {
+                            let y1 = (y0 + 3.0).min(*h);
+                            ctx.draw(&CLine { x1: *cx, y1: y0, x2: *cx, y2: y1, color: g[k.min(g.len() - 1)] });
+                            y0 += 4.0;
+                            k += 1;
+                        }
+                    }
+                }
             }
+            // own layer: the line replaces the fill's dots in its cells, so
+            // it reads as a distinct trace instead of vanishing into the fill
+            ctx.layer();
             for w in overlay_tops.windows(2) {
                 let (x0, y0) = w[0];
                 let (x1, y1) = w[1];

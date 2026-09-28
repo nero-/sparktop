@@ -13,7 +13,7 @@ pub fn parse_collection(raw: &str, t_unix_us: u64) -> anyhow::Result<Sample> {
             match section {
                 "HOSTNAME" => s.hostname = buf.trim().to_string(),
                 "UPTIME_S" => {
-                    s.uptime_s = buf.trim().split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                    s.uptime_s = buf.lines().next().unwrap_or("").trim().split('.').next().unwrap_or("0").parse().unwrap_or(0);
                     if let Some(l) = buf.lines().nth(1) {
                         // " 09:08:31 up 2:26, 3 users, load average: 0.15, 6.56, 9.25"
                         if let Some(after) = l.split_once("load average:") {
@@ -285,6 +285,9 @@ pub fn parse_prometheus(text: &str) -> VllmMetrics {
         let key=format!("{name}[{}]",pairs.join(","));
         if m.raw.contains_key(&key) {continue;}
         m.raw.insert(key,v);
+        if m.model.is_none() {
+            m.model=pairs.iter().find_map(|p|p.split_once('=').filter(|(k,_)|k.trim()=="model_name").map(|(_,v)|v.trim_matches('"').to_string()));
+        }
         match name {
             "vllm:prompt_tokens_total"=>m.prompt_tps+=v,
             "vllm:generation_tokens_total"=>m.generation_tps+=v,
@@ -293,6 +296,11 @@ pub fn parse_prometheus(text: &str) -> VllmMetrics {
             "vllm:kv_cache_usage_perc"=>{m.gpu_cache_usage=m.gpu_cache_usage.max(v);modern_cache=true;},
             "vllm:gpu_cache_usage_perc"=>legacy_cache=legacy_cache.max(v),
             "vllm:cpu_cache_usage_perc"=>m.cpu_cache_usage=m.cpu_cache_usage.max(v),
+            "vllm:prefix_cache_hits_total"=>m.prefix_hits+=v,
+            "vllm:prefix_cache_queries_total"=>m.prefix_queries+=v,
+            "vllm:gpu_prefix_cache_hit_rate"=>m.prefix_hit_rate_gauge=Some(m.prefix_hit_rate_gauge.unwrap_or(0.0).max(v)),
+            "vllm:request_success_total"=>m.requests_done+=v,
+            "vllm:num_preemptions_total"=>m.preemptions+=v,
             "vllm:time_to_first_token_seconds_bucket"=>if let Some(le)=le(){bucket_push(&mut m.ttft_buckets,le,v);},
             "vllm:inter_token_latency_seconds_bucket"=>{modern_tpot=true;if let Some(le)=le(){bucket_push(&mut m.tpot_buckets,le,v);}},
             "vllm:time_per_output_token_seconds_bucket"=>if let Some(le)=le(){bucket_push(&mut legacy_tpot,le,v);},
