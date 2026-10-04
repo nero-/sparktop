@@ -105,15 +105,15 @@ interval = 1.0            # seconds, 0.5–10
 
 [[nodes]]
 name = "spark-r0"
-host = "192.168.50.219"
-user = "nero"
+host = "$HOSTIP"
+user = "@USERNAME"
 cluster = "spark"         # optional group; `g` filters by it
 vllm_url = "http://localhost:8000"   # optional; fetched *from the node*
 
 [[nodes]]
 name = "spark-r1"
-host = "192.168.50.129"
-user = "nero"
+host = "$HOSTIP"
+user = "$USERNAME"
 cluster = "spark"
 
 # [alerts]                # thresholds that turn values and borders warn/bad
